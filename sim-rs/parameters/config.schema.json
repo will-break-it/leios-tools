@@ -134,6 +134,19 @@
       "enum": ["peer-order", "freshest-first", "oldest-first"],
       "type": "string"
     },
+    "VoteDiffusionStrategy": {
+      "description": "How a vote bundle reaches a peer. The three legacy values are accepted as aliases of announce-then-request, which is what configs setting them actually got.",
+      "enum": [
+        "announce-then-request",
+        "push",
+        "push-late-dedupe",
+        "push-no-dedupe",
+        "peer-order",
+        "freshest-first",
+        "oldest-first"
+      ],
+      "type": "string"
+    },
     "Distribution": {
       "anyOf": [
         {
@@ -730,8 +743,12 @@
       "type": "number"
     },
     "vote-diffusion-strategy": {
-      "$ref": "#/definitions/DiffusionStrategy",
-      "description": "Only supported by Haskell simulation."
+      "$ref": "#/definitions/VoteDiffusionStrategy",
+      "description": "How a vote bundle reaches a peer: announce-then-request, push, or push-no-dedupe."
+    },
+    "vote-diffusion-echo-to-source": {
+      "description": "Forward a vote back to the peer it arrived from. Off by default; the Haskell node does this because its notify server has no per-peer provenance.",
+      "type": "boolean"
     },
     "vote-generation-cpu-time-ms-constant": {
       "description": "Grandfathered for Haskell sim.",

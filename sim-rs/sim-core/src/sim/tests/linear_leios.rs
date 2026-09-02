@@ -12,7 +12,7 @@ use crate::{
     clock::{Clock, MockClockCoordinator, Timestamp},
     config::{
         CommitteeSelectionAlgorithm, NodeId, RawLinkInfo, RawNode, RawTopology, SimConfiguration,
-        TransactionConfig,
+        TransactionConfig, VoteDiffusionStrategy,
     },
     events::{Event, EventTracker},
     model::{LinearEndorserBlock, LinearRankingBlock, Transaction, VoteBundle},
@@ -235,6 +235,26 @@ impl TestDriver {
                 self.process_events(node, events);
             }
         }
+    }
+
+    /// Drive `node` all the way to a vote bundle of its own: it mints an RB
+    /// with an EB, then votes for that EB off the head of its own chain.
+    /// Nothing is diffused on the way, so the only messages the caller has to
+    /// reason about afterwards are the ones the vote bundle itself produced.
+    pub fn produce_vote_bundle(&mut self, node: NodeId) -> Arc<VoteBundle> {
+        let _txs: [_; 3] = self.produce_txs(node, false);
+        // A node does not wait out the equivocation window for an EB it
+        // produced itself, so it draws its vote lottery as soon as the EB
+        // exists.  Both wins have to be queued before the slot turns over.
+        self.win_next_rb_lottery(node, 0);
+        self.win_next_vote_lottery(node, 0);
+        self.next_slot();
+        let (_rb, eb) = self.expect_cpu_task_matching(node, is_new_rb_task);
+        let eb = eb.expect("node did not produce EB");
+
+        let votes = self.expect_cpu_task_matching(node, is_new_vote_task);
+        assert_eq!(*votes.ebs.first_key_value().unwrap().0, eb.id());
+        votes
     }
 
     pub fn expect_tx_sent(&mut self, from: NodeId, to: NodeId, tx: Arc<Transaction>) {
@@ -843,4 +863,194 @@ fn sim_config_rejects_top_stake_fraction_when_sigma_c_le_tau() {
         msg.contains("σ_c") && msg.contains("τ"),
         "expected σ_c/τ violation, got: {msg}"
     );
+}
+
+/// The default strategy sends the 8-byte id and waits to be asked for the
+/// body.  The body must never go out unsolicited, and the historic
+/// announce/request/deliver exchange must still deliver it.
+#[test]
+fn announce_then_request_should_not_push_vote_bundle() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2"])),
+        ("node-2", new_node(Some(1000), vec!["node-1"])),
+    ]);
+    let mut sim = TestDriver::new(topology);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    assert_eq!(
+        sim.config.vote_diffusion_strategy,
+        VoteDiffusionStrategy::AnnounceThenRequest,
+        "announce-then-request should be the default strategy"
+    );
+
+    let votes = sim.produce_vote_bundle(node1);
+
+    // The body is not queued: node 2 has to ask for it first.
+    sim.expect_no_message(node1, node2, Message::Votes(votes.clone()));
+    sim.expect_vote_bundle_sent(node1, node2, votes);
+}
+
+/// Under `push` the body itself is the first thing a peer sees.  There is no
+/// announcement to answer and no request round-trip.
+#[test]
+fn push_should_send_vote_bundle_body_directly() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2"])),
+        ("node-2", new_node(Some(1000), vec!["node-1"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.vote_diffusion_strategy = VoteDiffusionStrategy::Push;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+
+    let votes = sim.produce_vote_bundle(node1);
+
+    sim.expect_no_message(node1, node2, Message::AnnounceVotes(votes.id));
+    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes));
+}
+
+/// A pushed bundle is forwarded once it validates, but never back down the
+/// link it arrived on.
+#[test]
+fn push_should_forward_vote_bundle_but_not_to_source() {
+    // A line, so node 2 has one consumer besides the peer it hears from.
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2"])),
+        ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
+        ("node-3", new_node(Some(1000), vec!["node-2"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.vote_diffusion_strategy = VoteDiffusionStrategy::Push;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    let node3 = sim.id_for("node-3");
+
+    let votes = sim.produce_vote_bundle(node1);
+
+    // Node 1 pushes to its only consumer, which validates the bundle.
+    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes.clone()));
+
+    // Node 2 passes it on to node 3, and does not echo it back to node 1.
+    sim.expect_no_message(node2, node1, Message::Votes(votes.clone()));
+    sim.expect_message(node2, node3, Message::Votes(votes));
+}
+
+/// The Haskell node's notify server has no per-peer provenance, so it sends
+/// a bundle straight back to the peer it came from.  Setting
+/// `vote-diffusion-echo-to-source` reproduces that waste so it can be
+/// measured.
+#[test]
+fn push_should_echo_vote_bundle_to_source_when_configured() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2"])),
+        ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
+        ("node-3", new_node(Some(1000), vec!["node-2"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.vote_diffusion_strategy = VoteDiffusionStrategy::Push;
+        params.vote_diffusion_echo_to_source = true;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    let node3 = sim.id_for("node-3");
+
+    let votes = sim.produce_vote_bundle(node1);
+
+    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes.clone()));
+
+    // Every consumer gets the body, the source peer included.  Node 1 already
+    // holds the bundle, so its copy is dropped on arrival.
+    sim.expect_message(node2, node3, Message::Votes(votes.clone()));
+    sim.expect_message(node2, node1, Message::Votes(votes));
+}
+
+/// A second copy of a bundle a node already holds costs only the bytes: it is
+/// not validated again and it is not forwarded again.
+#[test]
+fn push_should_drop_duplicate_vote_bundle() {
+    // A triangle, so the bundle reaches node 2 twice: once from its producer
+    // and once by way of node 3.
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2", "node-3"])),
+        ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
+        ("node-3", new_node(Some(1000), vec!["node-1", "node-2"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.vote_diffusion_strategy = VoteDiffusionStrategy::Push;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    let node3 = sim.id_for("node-3");
+
+    let votes = sim.produce_vote_bundle(node1);
+
+    // Node 1 pushes to both peers, and each forwards to the other.
+    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes.clone()));
+    sim.expect_message(node1, node3, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node3, CpuTask::VTBundleValidated(node1, votes.clone()));
+
+    // Drain node 2's forward so anything queued to node 3 afterwards is new.
+    sim.expect_message(node2, node3, Message::Votes(votes.clone()));
+
+    // Node 3's copy now lands on node 2, which already holds the bundle.
+    sim.expect_message(node3, node2, Message::Votes(votes.clone()));
+
+    let revalidated = sim
+        .queued
+        .get(&node2)
+        .map(|q| {
+            q.tasks
+                .iter()
+                .any(|t| matches!(t, CpuTask::VTBundleValidated(..)))
+        })
+        .unwrap_or(false);
+    assert!(
+        !revalidated,
+        "duplicate vote bundle should not be validated a second time"
+    );
+    sim.expect_no_message(node2, node1, Message::Votes(votes.clone()));
+    sim.expect_no_message(node2, node3, Message::Votes(votes));
+}
+
+/// `push-no-dedupe` is the deliberate worst case: it pays for a bundle it
+/// already holds and sends it on again.  Only that single step is asserted;
+/// the strategy is a broadcast storm and does not settle if run out.
+#[test]
+fn push_no_dedupe_should_revalidate_duplicate_vote_bundle() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2", "node-3"])),
+        ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
+        ("node-3", new_node(Some(1000), vec!["node-1", "node-2"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.vote_diffusion_strategy = VoteDiffusionStrategy::PushNoDedupe;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    let node3 = sim.id_for("node-3");
+
+    let votes = sim.produce_vote_bundle(node1);
+
+    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes.clone()));
+    sim.expect_message(node1, node3, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node3, CpuTask::VTBundleValidated(node1, votes.clone()));
+
+    // Node 3's copy is a duplicate for node 2, and node 2 validates it anyway.
+    sim.expect_message(node3, node2, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node3, votes.clone()));
+
+    // Having revalidated it, node 2 sends it on to every consumer but node 3.
+    sim.expect_message(node2, node1, Message::Votes(votes));
 }

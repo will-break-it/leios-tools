@@ -268,9 +268,42 @@ committee-selection-algorithm: "wfa-ls"
 # Fraction of total stake eligible to vote when using "top-stake-fraction".
 committee-stake-fraction-threshold: 0.95
 
-vote-diffusion-strategy: "peer-order"
+# How a vote bundle reaches a peer.
+#
+#   announce-then-request  announce the bundle id, wait for the peer to ask,
+#                          then send the body.  Each body crosses the network
+#                          exactly once per node, so there are no duplicates.
+#                          Historic behaviour, and the default so that earlier
+#                          studies stay reproducible.
+#   push                   send the body straight to peers, forwarding a bundle
+#                          only the first time it is seen.  What both Leios node
+#                          implementations do.  Traffic is bounded by links
+#                          rather than by nodes.  A copy arriving while another
+#                          is still being validated is dropped before it costs
+#                          anything.
+#   push-late-dedupe       as push, but suppression applies only once a bundle
+#                          is fully held, so copies arriving during the
+#                          validation window are each validated.  This is the
+#                          Haskell node's ordering, which verifies before
+#                          inserting into its seen-set.
+#   push-no-dedupe         forward on every arrival, including bundles already
+#                          held.  Not a run arm: forwarding on every arrival has
+#                          no damping, so on any topology with cycles this is a
+#                          broadcast storm that does not terminate.  Kept as the
+#                          evidence that suppression is load-bearing.
+#
+# The legacy values "peer-order", "freshest-first" and "oldest-first" were never
+# read by this simulator and are accepted as aliases of announce-then-request,
+# which is the behaviour the configs that set them actually got.
+vote-diffusion-strategy: "announce-then-request"
 
-# Haskell prototype relay mini-protocol parameters.
+# Forward a vote back to the peer it arrived from.  Pure waste, and off here,
+# but the Haskell node's notify server has no per-peer provenance and so does
+# exactly this.  The option exists to measure that gap.
+vote-diffusion-echo-to-source: false
+
+# Haskell prototype relay mini-protocol parameters.  Not read by this simulator;
+# kept for parity with the Haskell simulator's configuration.
 vote-diffusion-max-bodies-to-request: 1
 vote-diffusion-max-headers-to-request: 100
 vote-diffusion-max-window-size: 100

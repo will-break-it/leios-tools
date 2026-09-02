@@ -1604,8 +1604,38 @@ impl LinearLeiosNode {
         self.leios
             .votes
             .insert(votes.id, VoteBundleView::Received { votes });
+        self.diffuse_vote_bundle(id, None);
+    }
+
+    /// Send a vote bundle onwards to consumers.
+    ///
+    /// `from` is the peer it arrived from, and is skipped unless
+    /// `vote-diffusion-echo-to-source` is set; `None` when we produced it.
+    /// Under `announce-then-request` this sends the 8-byte id and the peer
+    /// asks for the body; under the push strategies it sends the body.
+    fn diffuse_vote_bundle(&mut self, id: VoteBundleId, from: Option<NodeId>) {
+        let push = self.sim_config.vote_diffusion_strategy.is_push();
+        let echo = self.sim_config.vote_diffusion_echo_to_source;
+        let body = if push {
+            match self.leios.votes.get(&id) {
+                Some(VoteBundleView::Received { votes }) => Some(votes.clone()),
+                // Nothing to push until the bundle is actually held.
+                _ => return,
+            }
+        } else {
+            None
+        };
         for peer in &self.consumers {
-            self.queued.send_to(*peer, Message::AnnounceVotes(id));
+            if !echo && Some(*peer) == from {
+                continue;
+            }
+            match &body {
+                Some(votes) => {
+                    self.tracker.track_votes_sent(votes, self.id, *peer);
+                    self.queued.send_to(*peer, Message::Votes(votes.clone()));
+                }
+                None => self.queued.send_to(*peer, Message::AnnounceVotes(id)),
+            }
         }
     }
 
@@ -1632,13 +1662,41 @@ impl LinearLeiosNode {
 
     fn receive_votes(&mut self, from: NodeId, votes: Arc<VoteBundle>) {
         self.tracker.track_votes_received(&votes, from, self.id);
+        // A bundle already held costs nothing beyond the bytes: real nodes test
+        // the seen-set rather than verifying again.  Only the push strategies
+        // can deliver a body twice; under announce-then-request a node asks for
+        // each bundle and the arriving body is the answer, so that path is left
+        // exactly as it was.
+        let strategy = self.sim_config.vote_diffusion_strategy;
+        let already_have = strategy.is_push()
+            && match self.leios.votes.get(&votes.id) {
+                // Fully held: a duplicate under every push strategy.
+                Some(VoteBundleView::Received { .. }) => true,
+                // Still validating.  Only early suppression calls this a
+                // duplicate; late suppression pays for the verification, as
+                // the Haskell node does.
+                Some(VoteBundleView::Requested) => strategy.suppresses_in_flight(),
+                None => false,
+            };
+        if already_have && !strategy.forwards_duplicates() {
+            self.tracker.track_votes_duplicate(&votes, from, self.id);
+            return;
+        }
+        if strategy.suppresses_in_flight() {
+            // Mark it in flight so copies arriving while this one validates
+            // are recognised as duplicates rather than validated again.
+            self.leios
+                .votes
+                .entry(votes.id)
+                .or_insert(VoteBundleView::Requested);
+        }
         self.queued
             .schedule_cpu_task(CpuTask::VTBundleValidated(from, votes));
     }
 
     fn finish_validating_vote_bundle(&mut self, from: NodeId, votes: Arc<VoteBundle>) {
         let id = votes.id;
-        if self
+        let already_held = self
             .leios
             .votes
             .insert(
@@ -1647,17 +1705,19 @@ impl LinearLeiosNode {
                     votes: votes.clone(),
                 },
             )
-            .is_some_and(|v| matches!(v, VoteBundleView::Received { .. }))
+            .is_some_and(|v| matches!(v, VoteBundleView::Received { .. }));
+        if already_held
+            && !self
+                .sim_config
+                .vote_diffusion_strategy
+                .forwards_duplicates()
         {
             return;
         }
-        self.count_votes(&votes);
-        for peer in &self.consumers {
-            if *peer == from {
-                continue;
-            }
-            self.queued.send_to(*peer, Message::AnnounceVotes(id));
+        if !already_held {
+            self.count_votes(&votes);
         }
+        self.diffuse_vote_bundle(id, Some(from));
     }
 
     fn count_votes(&mut self, votes: &VoteBundle) {

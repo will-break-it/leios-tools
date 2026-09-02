@@ -502,6 +502,13 @@ impl EventMonitor {
                 Event::VTBundleReceived { .. } => {
                     vote_messages.received += 1;
                 }
+                Event::VTBundleDuplicate { msg_size_bytes, .. } => {
+                    // The arrival was already counted by the VTBundleReceived
+                    // emitted for it; this only records that it was dropped
+                    // rather than accepted, and what the bytes cost.
+                    vote_messages.duplicates += 1;
+                    vote_messages.duplicate_bytes += msg_size_bytes;
+                }
 
                 // CIP-0164 per-vote events (shared-consensus adapter).
                 Event::VoteGenerated {
@@ -973,14 +980,34 @@ impl EndorserBlock {
 struct MessageStats {
     sent: u64,
     received: u64,
+    /// Arrivals dropped because the recipient already held the item.  Only
+    /// the push vote strategies can produce these; the announce-then-request
+    /// path never delivers a body twice.
+    duplicates: u64,
+    duplicate_bytes: u64,
 }
 impl MessageStats {
     fn summary_line(&self, name: &str) -> String {
         let percent_received = self.received as f64 / self.sent as f64 * 100.0;
-        format!(
+        let mut line = format!(
             "{} {} message(s) were sent. {} of them were received ({:.3}%).",
             self.sent, name, self.received, percent_received
-        )
+        );
+        if self.duplicates > 0 {
+            let accepted = self.received - self.duplicates;
+            let percent_duplicate = self.duplicates as f64 / self.received as f64 * 100.0;
+            let copies_per_accepted = self.received as f64 / accepted as f64;
+            line.push_str(&format!(
+                " {} of those ({:.3}%) were duplicates costing {:.2} MB; \
+                 {:.2} copies arrived per accepted {}.",
+                self.duplicates,
+                percent_duplicate,
+                self.duplicate_bytes as f64 / 1e6,
+                copies_per_accepted,
+                name
+            ));
+        }
+        line
     }
 }
 

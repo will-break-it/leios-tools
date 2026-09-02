@@ -338,6 +338,13 @@ pub struct RawParameters {
     pub non_persistent_vote_bundle_size_bytes_per_eb: u64,
     #[serde(default)]
     pub committee_selection_algorithm: CommitteeSelectionAlgorithm,
+    #[serde(default)]
+    pub vote_diffusion_strategy: VoteDiffusionStrategy,
+    /// Forward a vote back to the peer it arrived from.  Pure waste, and off
+    /// by default, but the Haskell node's notify server has no per-peer
+    /// provenance and so does exactly this.
+    #[serde(default)]
+    pub vote_diffusion_echo_to_source: bool,
     #[serde(default = "default_committee_stake_fraction_threshold")]
     pub committee_stake_fraction_threshold: f64,
 
@@ -457,6 +464,59 @@ pub enum CommitteeSelectionAlgorithm {
     WfaLs,
     Everyone,
     TopStakeFraction,
+}
+
+/// How a vote bundle reaches a peer.
+///
+/// The simulator has only ever done `AnnounceThenRequest`, which delivers
+/// each body exactly once per node.  Both node implementations instead push
+/// bodies inline, bounded by links rather than by nodes.  See
+/// `vote-diffusion-strategy` in `config.default.yaml`.
+#[derive(Debug, Default, Copy, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum VoteDiffusionStrategy {
+    /// Announce the id, wait for a request, then send the body.
+    ///
+    /// The aliases are the values of the never-read `vote-diffusion-strategy`
+    /// key that several committed configs still set.  They resolve here
+    /// because this is the behaviour those runs actually got, so the published
+    /// study configs keep parsing and keep their exact semantics.
+    #[default]
+    #[serde(alias = "peer-order", alias = "freshest-first", alias = "oldest-first")]
+    AnnounceThenRequest,
+    /// Push the body straight to peers, forwarding a bundle only the first
+    /// time it is seen.  A copy arriving while another is still being
+    /// validated is recognised and dropped before it costs anything.
+    Push,
+    /// As `Push`, but suppression applies only once a bundle is fully held,
+    /// so copies arriving during the validation window are each validated.
+    /// This is the Haskell node's ordering: it verifies before inserting into
+    /// its seen-set and notes "one redundant verification per
+    /// concurrently-received duplicate".  Forwarding still happens once.
+    PushLateDedupe,
+    /// Push the body on every arrival, re-forwarding bundles already held.
+    ///
+    /// Not a design candidate and not a run arm: forwarding on every arrival
+    /// has no damping, so on any topology with cycles it is a broadcast storm
+    /// that does not terminate.  Kept because it is the executable evidence
+    /// that suppression is load-bearing rather than an optimisation.
+    PushNoDedupe,
+}
+
+impl VoteDiffusionStrategy {
+    /// True when bodies are pushed rather than announced.
+    pub fn is_push(self) -> bool {
+        matches!(self, Self::Push | Self::PushLateDedupe | Self::PushNoDedupe)
+    }
+    /// True when an already-held bundle is forwarded again.
+    pub fn forwards_duplicates(self) -> bool {
+        matches!(self, Self::PushNoDedupe)
+    }
+    /// True when a bundle is marked on receipt, so copies arriving while it
+    /// is still being validated are dropped rather than validated again.
+    pub fn suppresses_in_flight(self) -> bool {
+        matches!(self, Self::Push)
+    }
 }
 
 fn default_committee_stake_fraction_threshold() -> f64 {
@@ -1382,6 +1442,8 @@ pub struct SimConfiguration {
     /// Quorum fraction (CIP-0164 default 0.75).  Compare votes against
     /// `quorum_weight_fraction × expected_total_weight`.
     pub quorum_weight_fraction: f64,
+    pub vote_diffusion_strategy: VoteDiffusionStrategy,
+    pub vote_diffusion_echo_to_source: bool,
     /// Quorum denominator in the units the relevant node implementation
     /// sums per-voter weights.  WfaLs/Everyone: seats or node count.
     /// TopStakeFraction (CIP-164 PR #1196): `total_stake`.
@@ -1614,6 +1676,8 @@ impl SimConfiguration {
             persistent_voters: params.persistent_voters,
             non_persistent_voters: params.non_persistent_voters,
             quorum_weight_fraction: params.quorum_weight_fraction,
+            vote_diffusion_strategy: params.vote_diffusion_strategy,
+            vote_diffusion_echo_to_source: params.vote_diffusion_echo_to_source,
             expected_total_weight,
             vote_slot_length: params.leios_stage_active_voting_slots,
             eb_include_txs_from_previous_stage: params.eb_include_txs_from_previous_stage,

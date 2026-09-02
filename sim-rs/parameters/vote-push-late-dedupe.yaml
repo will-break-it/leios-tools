@@ -1,0 +1,6 @@
+# Vote diffusion arm: push-late-dedupe, echo-to-source false.
+# Layer over a scenario config, e.g.
+#   sim-cli <topology> -p parameters/linear-with-tx-references.yaml \
+#     -p parameters/turbo.yaml -p parameters/vote-push-late-dedupe.yaml
+vote-diffusion-strategy: "push-late-dedupe"
+vote-diffusion-echo-to-source: false

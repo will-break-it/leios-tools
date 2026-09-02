@@ -291,6 +291,16 @@ pub enum Event {
         recipient: Node,
         msg_size_bytes: u64,
     },
+    /// A vote bundle arrived that the recipient already held, so it was
+    /// dropped without validation or forwarding.  The bytes were still spent:
+    /// this is the cost of pushing rather than pulling.
+    VTBundleDuplicate {
+        id: VoteBundleId<Node>,
+        producer: Node,
+        sender: Node,
+        recipient: Node,
+        msg_size_bytes: u64,
+    },
     VTBundleReceived {
         id: VoteBundleId<Node>,
         slot: u64,
@@ -403,6 +413,7 @@ impl Event {
             | Self::VTBundleNotGenerated { producer, .. } => Some(producer.id),
             Self::VTBundleSent { sender, .. } => Some(sender.id),
             Self::VTBundleReceived { recipient, .. } => Some(recipient.id),
+            Self::VTBundleDuplicate { recipient, .. } => Some(recipient.id),
             Self::VoteGenerated { voter, .. } => Some(voter.id),
             Self::VoteSent { sender, .. } => Some(sender.id),
             Self::VoteReceived { recipient, .. } => Some(recipient.id),
@@ -942,6 +953,17 @@ impl EventTracker {
             id: self.to_vote_bundle(votes.id),
             slot: votes.id.slot,
             pipeline: votes.id.pipeline,
+            producer: self.to_node(votes.id.producer),
+            sender: self.to_node(sender),
+            recipient: self.to_node(recipient),
+            msg_size_bytes: votes.bytes,
+        });
+    }
+
+    /// A bundle arrived that we already had.  Records the wasted bytes.
+    pub fn track_votes_duplicate(&self, votes: &VoteBundle, sender: NodeId, recipient: NodeId) {
+        self.send(Event::VTBundleDuplicate {
+            id: self.to_vote_bundle(votes.id),
             producer: self.to_node(votes.id.producer),
             sender: self.to_node(sender),
             recipient: self.to_node(recipient),
