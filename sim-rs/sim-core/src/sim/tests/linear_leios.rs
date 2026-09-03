@@ -1965,3 +1965,147 @@ fn no_vote_is_cast_before_the_gate() {
         "and the gate is exactly when it may"
     );
 }
+
+/// A star, so the centre has `spokes` consumers to choose between.
+fn new_star_topology(spokes: usize) -> RawTopology {
+    let mut nodes = vec![("node-1", new_node(Some(1000), vec![]))];
+    for name in SPOKE_NAMES.iter().take(spokes) {
+        nodes.push((*name, new_node(Some(1000), vec!["node-1"])));
+    }
+    new_topology(nodes)
+}
+
+const SPOKE_NAMES: [&str; 6] = ["node-2", "node-3", "node-4", "node-5", "node-6", "node-7"];
+
+/// Who did `from` push a vote body to, without consuming the messages?
+fn vote_push_targets(sim: &TestDriver, from: NodeId) -> std::collections::BTreeSet<NodeId> {
+    sim.queued
+        .get(&from)
+        .map(|q| {
+            q.messages
+                .iter()
+                .filter(|(_, m)| matches!(m, Message::Votes(_)))
+                .map(|(to, _)| *to)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Bounded fanout pushes to `vote-push-fanout` peers, not to every consumer.
+/// This is the whole point of the arm: the duplicate flood is proportional
+/// to the fanout, so capping it is what removes the redundant verifications.
+#[test]
+fn bounded_fanout_pushes_to_exactly_the_configured_number_of_peers() {
+    let config = new_sim_config_with(new_star_topology(4), |params| {
+        params.vote_transport = VoteTransport::Push;
+        params.vote_push_fanout = Some(2);
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+
+    sim.produce_vote_bundle(node1);
+
+    let targets = vote_push_targets(&sim, node1);
+    assert_eq!(
+        targets.len(),
+        2,
+        "expected the body on exactly 2 of 4 links, got {targets:?}"
+    );
+}
+
+/// Asking for more peers than exist is not an error and not a truncation:
+/// every consumer gets the body, exactly as with no limit at all.
+#[test]
+fn fanout_larger_than_the_peer_count_pushes_to_every_consumer() {
+    let config = new_sim_config_with(new_star_topology(4), |params| {
+        params.vote_transport = VoteTransport::Push;
+        params.vote_push_fanout = Some(10);
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+
+    sim.produce_vote_bundle(node1);
+
+    assert_eq!(vote_push_targets(&sim, node1).len(), 4);
+}
+
+/// The subset is a pure function of the seed, so two runs of the same
+/// configuration choose the same peers.  Without this the arm could not be
+/// compared against any other, because each run would diffuse differently.
+#[test]
+fn bounded_fanout_chooses_the_same_peers_on_every_run() {
+    let choose = || {
+        let config = new_sim_config_with(new_star_topology(4), |params| {
+            params.vote_transport = VoteTransport::Push;
+            params.vote_push_fanout = Some(2);
+        });
+        let mut sim = TestDriver::new_with_config(config);
+        let node1 = sim.id_for("node-1");
+        sim.produce_vote_bundle(node1);
+        vote_push_targets(&sim, node1)
+    };
+    assert_eq!(choose(), choose());
+}
+
+/// Turning the limit off restores the unbounded behaviour byte for byte,
+/// so the default arm is unaffected by this parameter existing.
+#[test]
+fn no_fanout_limit_pushes_to_every_consumer() {
+    let config = new_sim_config_with(new_star_topology(4), |params| {
+        params.vote_transport = VoteTransport::Push;
+        params.vote_push_fanout = None;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+
+    sim.produce_vote_bundle(node1);
+
+    assert_eq!(vote_push_targets(&sim, node1).len(), 4);
+}
+
+/// A limit that cannot take effect is rejected rather than ignored: a run
+/// that quietly used the default would still print numbers, and nothing in
+/// the output would say the limit was dropped.
+#[test]
+fn sim_config_rejects_a_fanout_limit_that_could_not_apply() {
+    // (name, transport, fanout, variant, expected error fragment)
+    let cases = [
+        (
+            "zero",
+            VoteTransport::Push,
+            0u64,
+            crate::config::LeiosVariant::LinearWithTxReferences,
+            "vote-push-fanout is 0",
+        ),
+        (
+            "not a push transport",
+            VoteTransport::AnnounceThenRequest,
+            2,
+            crate::config::LeiosVariant::LinearWithTxReferences,
+            "would have no effect",
+        ),
+        (
+            "not a linear variant",
+            VoteTransport::Push,
+            2,
+            crate::config::LeiosVariant::Short,
+            "linear Leios variants only",
+        ),
+    ];
+    for (name, transport, fanout, variant, expected) in cases {
+        let mut params: crate::config::RawParameters =
+            serde_yaml::from_slice(include_bytes!("../../../../parameters/config.default.yaml"))
+                .unwrap();
+        params.leios_variant = variant;
+        params.vote_transport = transport;
+        params.vote_push_fanout = Some(fanout);
+        let err = SimConfiguration::build(params, new_star_topology(4).into()).expect_err(
+            &format!("{name}: a fanout limit that cannot apply must be rejected"),
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(expected),
+            "{name}: expected an error mentioning {expected:?}, got {msg:?}"
+        );
+    }
+}

@@ -319,6 +319,18 @@ vote-transport: "announce-then-request"
 # is the published baseline, so the flag leaves it alone.
 vote-transport-echo-to-source: false
 
+# Push a vote body to at most this many peers instead of every consumer.
+# Unset (the default) means every consumer, which is what both node
+# implementations do.
+#
+# This is a proposal, not a CIP-0164 rule.  The specification caps how many
+# *distinct* votes a node relays per committee member per slot, which the
+# bundle key already enforces here; nothing in it bounds how many *copies* of
+# one vote cross the network, and the copies are what cost verification time.
+# Applies to the push transports only: announce-then-request sends a body only
+# when a peer asks for it and so produces no copies to cut.
+vote-push-fanout: null
+
 # Haskell prototype relay mini-protocol parameters.  Not read by this simulator;
 # kept for parity with the Haskell simulator's configuration.
 vote-diffusion-max-bodies-to-request: 1

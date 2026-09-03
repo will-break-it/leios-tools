@@ -1663,8 +1663,52 @@ impl LinearLeiosNode {
         } else {
             None
         };
+        // Bounded fanout: push the body to at most `k` peers rather than
+        // every consumer.  Only the push path floods, so only the push
+        // path is limited; the announce path sends a body when asked and
+        // produces no copies to cut.
+        //
+        // The subset is chosen by ranking peers on a hash of
+        // `(sender, bundle, peer)` under the global seed.  That is a pure
+        // function of the seed, so it is identical across runs, platforms
+        // and shard layouts, and independent of arrival order and of how
+        // many draws this node has already made -- none of which is true
+        // of drawing from a per-node stream.  Keying on the bundle means
+        // each vote takes its own subgraph, so the union over a committee
+        // still covers the network even though one vote does not.
+        let selected: Option<BTreeSet<NodeId>> = match (&body, self.sim_config.vote_push_fanout) {
+            (Some(_), Some(k)) => {
+                let eligible: Vec<NodeId> = self
+                    .consumers
+                    .iter()
+                    .copied()
+                    .filter(|peer| echo || Some(*peer) != from)
+                    .collect();
+                if eligible.len() as u64 <= k {
+                    None
+                } else {
+                    let rng = Rng::new(self.sim_config.seed);
+                    let mut ranked: Vec<(u64, NodeId)> = eligible
+                        .into_iter()
+                        .map(|peer| (rng.draw_u64_with_context(&(self.id, id, peer)), peer))
+                        .collect();
+                    ranked.sort_unstable();
+                    Some(
+                        ranked
+                            .into_iter()
+                            .take(k as usize)
+                            .map(|(_, p)| p)
+                            .collect(),
+                    )
+                }
+            }
+            _ => None,
+        };
         for peer in &self.consumers {
             if !echo && Some(*peer) == from {
+                continue;
+            }
+            if selected.as_ref().is_some_and(|set| !set.contains(peer)) {
                 continue;
             }
             match &body {

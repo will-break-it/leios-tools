@@ -352,6 +352,19 @@ pub struct RawParameters {
     /// leaves it alone rather than adding a round trip on every link.
     #[serde(default)]
     pub vote_transport_echo_to_source: bool,
+    /// Push a vote body to at most this many peers instead of every
+    /// consumer.  Unset means every consumer, which is what both node
+    /// implementations do and is the default.
+    ///
+    /// This is a proposal of ours, not a CIP-0164 rule.  The specification
+    /// caps how many *distinct* votes a node relays per committee member
+    /// per slot, which a bundle key already enforces here; it places no
+    /// bound on how many *copies* of one vote cross the network, and the
+    /// copies are what cost verification time.  Applies to the push
+    /// transports only: `announce-then-request` sends bodies solely on
+    /// request and already produces no copies.
+    #[serde(default)]
+    pub vote_push_fanout: Option<u64>,
     #[serde(default = "default_committee_stake_fraction_threshold")]
     pub committee_stake_fraction_threshold: f64,
     /// Committee size in seats, used by `top-stake-seats`.  CIP-0164
@@ -1467,6 +1480,9 @@ pub struct SimConfiguration {
     pub quorum_weight_fraction: f64,
     pub vote_transport: VoteTransport,
     pub vote_transport_echo_to_source: bool,
+    /// Push a vote body to at most this many peers.  `None` means every
+    /// consumer.  See `RawParameters::vote_push_fanout`.
+    pub vote_push_fanout: Option<u64>,
     /// Quorum denominator in the units the relevant node implementation
     /// sums per-voter weights.  WfaLs/Everyone: seats or node count.
     /// TopStakeFraction (CIP-164 PR #1196): `total_stake`.
@@ -1780,6 +1796,34 @@ impl SimConfiguration {
             // unreachable on any topology with fewer pools than seats.
             CommitteeSelectionAlgorithm::TopStakeSeats => vote_eligible_nodes.len() as u64,
         };
+        // A knob that is silently ignored is worse than one that is
+        // absent, because a run still produces numbers and nothing says
+        // they came from the default.  Bounded fanout is read in one
+        // place, `linear_leios::diffuse_vote_bundle`, and only on the
+        // push path, so reject every configuration that would not reach
+        // it rather than the one that happened to be noticed.
+        if let Some(fanout) = params.vote_push_fanout {
+            if fanout == 0 {
+                bail!(
+                    "vote-push-fanout is 0, so a vote would never leave the node that cast                      it and no endorser block could ever reach a quorum"
+                );
+            }
+            if !matches!(
+                params.leios_variant,
+                LeiosVariant::Linear | LeiosVariant::LinearWithTxReferences
+            ) {
+                bail!(
+                    "vote-push-fanout is implemented for the linear Leios variants only                      ('linear', 'linear-with-tx-references'); {:?} diffuses votes by its own                      path and would ignore the limit",
+                    params.leios_variant
+                );
+            }
+            if !params.vote_transport.is_push() {
+                bail!(
+                    "vote-push-fanout bounds how many peers a vote body is pushed to, but                      vote-transport is {:?}, which sends a body only when a peer asks for                      it; the limit would have no effect",
+                    params.vote_transport
+                );
+            }
+        }
         Ok(Self {
             seed: params.seed,
             timestamp_resolution: duration_ms(params.timestamp_resolution_ms),
@@ -1831,6 +1875,7 @@ impl SimConfiguration {
             quorum_weight_fraction: params.quorum_weight_fraction,
             vote_transport: params.vote_transport,
             vote_transport_echo_to_source: params.vote_transport_echo_to_source,
+            vote_push_fanout: params.vote_push_fanout,
             expected_total_weight,
             vote_slot_length: params.leios_stage_active_voting_slots,
             eb_include_txs_from_previous_stage: params.eb_include_txs_from_previous_stage,
