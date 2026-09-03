@@ -11,8 +11,8 @@ use tokio::sync::mpsc;
 use crate::{
     clock::{Clock, MockClockCoordinator, Timestamp},
     config::{
-        CommitteeSelectionAlgorithm, NodeId, RawLinkInfo, RawNode, RawTopology, RelayStrategy,
-        SimConfiguration, TransactionConfig, VoteTransport,
+        CommitteeSelectionAlgorithm, LeiosVariant, NodeId, RawLinkInfo, RawNode, RawTopology,
+        RelayStrategy, SimConfiguration, TransactionConfig, VoteTransport,
     },
     events::{Event, EventTracker},
     model::{LinearEndorserBlock, LinearRankingBlock, Transaction, VoteBundle},
@@ -457,6 +457,37 @@ fn duplicate_reports(events: &[Event]) -> Vec<(NodeId, NodeId)> {
             Event::VTBundleDuplicate {
                 sender, recipient, ..
             } => Some((sender.id, recipient.id)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every reported vote-protocol message, as
+/// (kind, sender, recipient, bytes).  Announcements and requests are the two
+/// that used to go uncounted, which is what made the arm that sends the most
+/// messages look like the one that sends the fewest.
+fn vote_wire_reports(events: &[Event]) -> Vec<(&'static str, NodeId, NodeId, u64)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::VTBundleSent {
+                sender,
+                recipient,
+                msg_size_bytes,
+                ..
+            } => Some(("body", sender.id, recipient.id, *msg_size_bytes)),
+            Event::VTBundleAnnounced {
+                sender,
+                recipient,
+                msg_size_bytes,
+                ..
+            } => Some(("announce", sender.id, recipient.id, *msg_size_bytes)),
+            Event::VTBundleRequested {
+                sender,
+                recipient,
+                msg_size_bytes,
+                ..
+            } => Some(("request", sender.id, recipient.id, *msg_size_bytes)),
             _ => None,
         })
         .collect()
@@ -1120,6 +1151,115 @@ fn sim_config_rejects_top_stake_seats_with_zero_seats() {
     );
 }
 
+/// A two-node topology and default parameters, ready for a build that is
+/// expected to succeed or fail on the committee mode alone.
+fn seat_count_params(
+    variant: LeiosVariant,
+) -> (crate::config::RawParameters, crate::config::Topology) {
+    let topology = new_topology(vec![
+        ("pool-a", new_node(Some(600), vec!["pool-b"])),
+        ("pool-b", new_node(Some(400), vec!["pool-a"])),
+    ]);
+    let mut params: crate::config::RawParameters =
+        serde_yaml::from_slice(include_bytes!("../../../../parameters/config.default.yaml"))
+            .unwrap();
+    params.leios_variant = variant;
+    params.committee_selection_algorithm = CommitteeSelectionAlgorithm::TopStakeSeats;
+    params.committee_seat_count = 2;
+    // One shard group, so `full-without-ibs` clears the unrelated sharding
+    // check that runs before the committee mode is looked at and the build
+    // fails, or succeeds, on the committee mode alone.
+    params.ib_shard_group_count = 1;
+    (params, topology.into())
+}
+
+/// `top-stake-seats` seats a committee and sets a seat-based quorum
+/// denominator, but only the linear node reads that seating when it decides
+/// whether, and with what weight, it votes.  Every other variant runs its own
+/// lottery and never looks at it, so the votes it casts are measured against
+/// a denominator nobody voted into and the certification figures mean
+/// nothing.  Rejecting only shared-consensus left four variants that built
+/// fine, ran, and reported those figures without a word.
+#[test]
+fn sim_config_rejects_top_stake_seats_for_variants_that_ignore_it() {
+    for variant in [
+        LeiosVariant::Short,
+        LeiosVariant::Full,
+        LeiosVariant::FullWithoutIbs,
+        LeiosVariant::FullWithTxReferences,
+        LeiosVariant::SharedConsensus,
+    ] {
+        let (params, topology) = seat_count_params(variant);
+        let err = SimConfiguration::build(params, topology).unwrap_err();
+        assert!(
+            err.to_string().contains("top-stake-seats"),
+            "{variant:?} ignores the seating, so pairing it with top-stake-seats \
+             has to be an error; got: {err}"
+        );
+    }
+}
+
+/// ...and the two that do honour it still build, so the guard rejects the
+/// pairing rather than the mode.
+#[test]
+fn sim_config_accepts_top_stake_seats_for_the_linear_variants() {
+    for variant in [LeiosVariant::Linear, LeiosVariant::LinearWithTxReferences] {
+        let (params, topology) = seat_count_params(variant);
+        let config = SimConfiguration::build(params, topology)
+            .unwrap_or_else(|e| panic!("{variant:?} honours the seating and must build: {e}"));
+        assert_eq!(config.expected_total_weight, 2, "{variant:?}");
+    }
+}
+
+/// `vote-diffusion-strategy` is the Haskell simulator's request-ordering key
+/// and is never read here; `vote-transport` is the one this simulator reads.
+/// The default config used to carry the transport's whole explanation above
+/// the former, and to promise that the former's values are accepted as
+/// aliases of `announce-then-request`.  They are not -- `VoteTransport`
+/// declares no aliases -- so a reader who followed that comment got a
+/// deserialization error.  Both halves of the claim are pinned here so the
+/// documentation cannot drift back onto the wrong key unnoticed.
+#[test]
+fn the_request_ordering_key_is_not_the_vote_transport() {
+    for value in ["peer-order", "freshest-first", "oldest-first"] {
+        assert!(
+            serde_yaml::from_str::<VoteTransport>(value).is_err(),
+            "{value} belongs to vote-diffusion-strategy; vote-transport has no such alias, \
+             and documenting one sends readers into a parse error"
+        );
+    }
+    for value in [
+        "announce-then-request",
+        "push",
+        "push-late-dedupe",
+        "push-no-dedupe",
+    ] {
+        serde_yaml::from_str::<VoteTransport>(value)
+            .unwrap_or_else(|e| panic!("{value} is a documented transport and must parse: {e}"));
+    }
+
+    // And the Haskell key has no say over the transport, whatever it is set to.
+    let mut config: serde_yaml::Value =
+        serde_yaml::from_slice(include_bytes!("../../../../parameters/config.default.yaml"))
+            .unwrap();
+    let key = serde_yaml::Value::from("vote-diffusion-strategy");
+    assert!(
+        config.get(&key).is_some(),
+        "the default config still ships the Haskell key this test is about"
+    );
+    config
+        .as_mapping_mut()
+        .unwrap()
+        .insert(key, serde_yaml::Value::from("oldest-first"));
+    let params: crate::config::RawParameters = serde_yaml::from_value(config).unwrap();
+    assert_eq!(
+        params.vote_transport,
+        VoteTransport::AnnounceThenRequest,
+        "moving the Haskell simulator's request-ordering key must not move this \
+         simulator's vote transport"
+    );
+}
+
 /// The default strategy sends the 8-byte id and waits to be asked for the
 /// body.  The body must never go out unsolicited, and the historic
 /// announce/request/deliver exchange must still deliver it.
@@ -1138,11 +1278,50 @@ fn announce_then_request_should_not_push_vote_bundle() {
         "announce-then-request should be the default strategy"
     );
 
+    let _ = sim.drain_tracked_events();
     let votes = sim.produce_vote_bundle(node1);
 
     // The body is not queued: node 2 has to ask for it first.
     sim.expect_no_message(node1, node2, Message::Votes(votes.clone()));
-    sim.expect_vote_bundle_sent(node1, node2, votes);
+    sim.expect_vote_bundle_sent(node1, node2, votes.clone());
+
+    // Delivering one body over this transport costs three messages, not one.
+    // Only the body was ever counted, so the arm that spends the most
+    // messages was the one that appeared to spend the fewest.
+    assert_eq!(
+        vote_wire_reports(&sim.drain_tracked_events()),
+        vec![
+            ("announce", node1, node2, 8),
+            ("request", node2, node1, 8),
+            ("body", node1, node2, votes.bytes),
+        ]
+    );
+}
+
+/// The push arms send the body and nothing else, so their message count is
+/// their body count.  That is the comparison the announcement and request
+/// counters exist to make honest.
+#[test]
+fn push_should_send_no_control_messages() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2"])),
+        ("node-2", new_node(Some(1000), vec!["node-1"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.vote_transport = VoteTransport::Push;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+
+    let _ = sim.drain_tracked_events();
+    let votes = sim.produce_vote_bundle(node1);
+    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+
+    assert_eq!(
+        vote_wire_reports(&sim.drain_tracked_events()),
+        vec![("body", node1, node2, votes.bytes)]
+    );
 }
 
 /// Under `push` the body itself is the first thing a peer sees.  There is no
@@ -1227,6 +1406,52 @@ fn push_should_echo_vote_bundle_to_source_when_configured() {
     sim.expect_message(node2, node1, Message::Votes(votes));
 }
 
+/// The echo models the Haskell node's notify server, which pushes bodies and
+/// has no per-peer provenance to exclude the sender with.
+/// `announce-then-request` has no such server: it would re-announce to the
+/// peer that just handed it the body, buying a request and a second copy of
+/// a bundle it is already holding.  That is not the gap the flag exists to
+/// measure, and `announce-then-request` is the published baseline, so the
+/// flag leaves it exactly as it was.
+#[test]
+fn announce_then_request_should_ignore_the_echo_flag() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2"])),
+        ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
+        ("node-3", new_node(Some(1000), vec!["node-2"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.vote_transport_echo_to_source = true;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    let node3 = sim.id_for("node-3");
+    assert_eq!(
+        sim.config.vote_transport,
+        VoteTransport::AnnounceThenRequest,
+        "the flag is set on the baseline transport, which is what it must not change"
+    );
+
+    let _ = sim.drain_tracked_events();
+    let votes = sim.produce_vote_bundle(node1);
+    sim.expect_vote_bundle_sent(node1, node2, votes.clone());
+
+    // Node 2 announces onwards to node 3 and says nothing back to node 1.
+    sim.expect_no_message(node2, node1, Message::AnnounceVotes(votes.id));
+    sim.expect_no_message(node2, node1, Message::Votes(votes.clone()));
+    assert_eq!(
+        vote_wire_reports(&sim.drain_tracked_events()),
+        vec![
+            ("announce", node1, node2, 8),
+            ("request", node2, node1, 8),
+            ("body", node1, node2, votes.bytes),
+            ("announce", node2, node3, 8),
+        ],
+        "one announcement onwards and nothing back down the link it came from"
+    );
+}
+
 /// A second copy of a bundle a node already holds costs only the bytes: it is
 /// not validated again and it is not forwarded again.
 #[test]
@@ -1304,16 +1529,54 @@ fn push_no_dedupe_should_revalidate_duplicate_vote_bundle() {
     // Node 3's copy is a duplicate for node 2, and node 2 validates it anyway.
     let _ = sim.drain_tracked_events();
     sim.expect_message(node3, node2, Message::Votes(votes.clone()));
-    let events = sim.drain_tracked_events();
-    assert_eq!(
-        duplicate_reports(&events),
-        vec![(node3, node2)],
-        "the arm that suppresses nothing is the one whose duplicates most need reporting"
-    );
+    let on_arrival = duplicate_reports(&sim.drain_tracked_events());
     sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node3, votes.clone()));
+    let after_validating = duplicate_reports(&sim.drain_tracked_events());
+
+    // Reported once, and reported where the arm actually pays for it: this
+    // is the one strategy that forwards a duplicate rather than dropping it,
+    // so it goes on to verify the copy and is charged for it at the far end.
+    // Reporting the same arrival on the way in as well drove duplicates past
+    // arrivals, which is how the summary came to print a duplicate share
+    // above 100% and an "inf" verification rate.
+    assert_eq!(
+        [on_arrival, after_validating].concat(),
+        vec![(node3, node2)],
+        "the arm that suppresses nothing is the one whose duplicates most need reporting, \
+         and it needs them reported once"
+    );
 
     // Having revalidated it, node 2 sends it on to every consumer but node 3.
-    sim.expect_message(node2, node1, Message::Votes(votes));
+    // Following that hop is the point: node 1 already holds the bundle, so
+    // its copy is the run's second duplicate, and stopping the test here left
+    // the one-report-per-arrival property asserted on a single arrival.  It
+    // is on the second, where a bundle that keeps being forwarded keeps being
+    // reported, that a double report compounds.
+    let _ = sim.drain_tracked_events();
+    sim.expect_message(node2, node1, Message::Votes(votes.clone()));
+    assert!(
+        duplicate_reports(&sim.drain_tracked_events()).is_empty(),
+        "this arm verifies before it calls a copy redundant, so nothing is \
+         reported on the way in"
+    );
+    assert_eq!(
+        sim.queued_vote_validations(node1),
+        1,
+        "the copy is queued for a verification node 1 does not need, which is \
+         the cost this arm exists to show"
+    );
+
+    sim.expect_cpu_task(node1, CpuTask::VTBundleValidated(node2, votes.clone()));
+    assert_eq!(
+        duplicate_reports(&sim.drain_tracked_events()),
+        vec![(node2, node1)],
+        "one report for this arrival too, at the far end, where the wasted \
+         verification was paid for"
+    );
+
+    // And on it goes: node 1 forwards a bundle it has now verified twice.
+    // This is the storm, and the reason the arm is never run out.
+    sim.expect_message(node1, node3, Message::Votes(votes));
 }
 
 /// `push-late-dedupe` marks a bundle only once it is fully held, so a copy
@@ -1531,6 +1794,96 @@ fn quorum_should_be_reported_when_the_tally_crosses_the_threshold() {
     );
 }
 
+/// Once per node per EB has to survive pruning.
+///
+/// A node prunes an EB's tally once that EB is endorsed on-chain, and the
+/// record that its quorum was already reported goes with it.  A vote bundle
+/// that finishes validating after the prune would rebuild the tally from
+/// zero and cross the threshold a second time, putting the same node into
+/// the summary's sample twice -- and the sample is stake-weighted, so its
+/// stake is counted twice in the median and the 95th percentile the study
+/// reports.  The pruned-EB tombstone is what stops it.
+#[test]
+fn a_late_vote_for_a_pruned_eb_does_not_report_a_second_quorum() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2", "node-3"])),
+        ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
+        ("node-3", new_node(Some(1000), vec!["node-1", "node-2"])),
+    ]);
+    // One vote certifies, so a single late bundle is enough to re-cross the
+    // threshold on a tally that has been reset to zero.
+    let config = new_sim_config_with(topology, |params| {
+        params.quorum_weight_fraction = 0.5;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    let node3 = sim.id_for("node-3");
+    assert_eq!(sim.config.vote_threshold(), 1);
+
+    let txs: [_; 3] = sim.produce_txs(node1, false);
+    for tx in &txs {
+        sim.expect_tx_sent(node1, node2, tx.clone());
+        sim.expect_tx_sent(node1, node3, tx.clone());
+    }
+
+    // Node 1 mints the EB and votes for it without waiting out the gate, the
+    // way a producer does for its own block.
+    sim.win_next_rb_lottery(node1, 0);
+    sim.win_next_vote_lottery(node1, 0);
+    sim.next_slot();
+    let (rb, eb) = sim.expect_cpu_task_matching(node1, is_new_rb_task);
+    let eb = eb.expect("node did not produce EB");
+    let votes_1 = sim.expect_cpu_task_matching(node1, is_new_vote_task);
+
+    sim.expect_rb_and_eb_sent(node1, node2, rb.clone(), Some(eb.clone()));
+    sim.expect_eb_validated(node2, eb.clone());
+    // Node 3 will vote at the gate, so its lottery is armed before it can
+    // draw.
+    sim.win_next_vote_lottery(node3, 0);
+    sim.expect_rb_and_eb_sent(node1, node3, rb, Some(eb.clone()));
+    sim.expect_eb_validated(node3, eb.clone());
+
+    // Node 1's vote is all it takes: node 2 has a quorum, and says so once.
+    let _ = sim.drain_tracked_events();
+    sim.expect_vote_bundle_sent(node1, node2, votes_1);
+    assert_eq!(
+        quorum_reports(&sim.drain_tracked_events()),
+        vec![(node2, 1)],
+        "one vote is the threshold here, so the first one crosses it"
+    );
+
+    // Node 3 votes at the gate.  Its bundle is announced to node 2 and left
+    // sitting there: it is the late arrival this test is about.
+    sim.advance_time_to(sim.config.voting_window().gate_at(eb.slot));
+    let votes_3 = sim.expect_cpu_task_matching(node3, is_new_vote_task);
+    assert_eq!(*votes_3.ebs.first_key_value().unwrap().0, eb.id());
+
+    // Node 2 certifies the EB in a ranking block of its own, which is what
+    // makes the EB old news and prunes its tally.
+    sim.advance_time_to(sim.config.voting_window().inclusion_deadline_at(eb.slot));
+    sim.win_next_rb_lottery(node2, 0);
+    sim.next_slot();
+    let (rb_2, _) = sim.expect_cpu_task_matching(node2, is_new_rb_task);
+    assert_eq!(
+        rb_2.endorsement.as_ref().map(|e| e.eb),
+        Some(eb.id()),
+        "the prune only happens once the EB is endorsed on-chain, so a block \
+         without the endorsement would leave this test asserting nothing"
+    );
+
+    // Node 3's bundle turns up after all that.  It is the first copy node 2
+    // has seen, so it is verified and counted -- and counted into an EB whose
+    // tally, and whose already-reported quorum, have both been erased.
+    let _ = sim.drain_tracked_events();
+    sim.expect_vote_bundle_sent(node3, node2, votes_3);
+    assert!(
+        quorum_reports(&sim.drain_tracked_events()).is_empty(),
+        "node 2 already reported this EB's quorum; reporting it again puts one \
+         node in the stake-weighted sample twice"
+    );
+}
+
 #[test]
 fn voting_window_is_anchored_on_the_announcing_slot() {
     let topology = new_topology(vec![
@@ -1582,8 +1935,19 @@ fn no_vote_is_cast_before_the_gate() {
     let (rb, eb) = sim.expect_cpu_task_matching(node1, is_new_rb_task);
     let eb = eb.expect("node did not produce EB");
     sim.expect_rb_and_eb_sent(node1, node2, rb, Some(eb.clone()));
-    sim.expect_eb_validated(node2, eb.clone());
+    // The lottery has to be armed before the EB validates, not after.  A node
+    // draws the moment it decides it may vote, so with the gate deleted
+    // altogether node 2 would draw on validation -- and lose, on an empty
+    // queue -- and every assertion below would still pass.  Arming it first
+    // means the only thing standing between node 2 and a vote is the gate,
+    // which is what this test is for.
     sim.win_next_vote_lottery(node2, 0);
+    sim.expect_eb_validated(node2, eb.clone());
+    assert_eq!(
+        sim.queued_vote_generations(node2),
+        0,
+        "validating the EB must not itself produce a vote: the gate has not passed"
+    );
 
     // The EB is validated and the lottery is won, so the only thing left
     // between node 2 and a vote is the equivocation-detection period.

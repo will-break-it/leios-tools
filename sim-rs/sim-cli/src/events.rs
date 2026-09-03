@@ -130,6 +130,7 @@ impl EventMonitor {
         let mut ib_messages = MessageStats::default();
         let mut eb_messages = MessageStats::default();
         let mut vote_messages = MessageStats::default();
+        let mut vote_wire = VoteWireStats::default();
         let mut no_vote_reasons: BTreeMap<NoVoteReason, u64> = BTreeMap::new();
         let mut txs_dropped_generated_backlog_full: u64 = 0;
         let mut txs_dropped_peer_backlog_full: u64 = 0;
@@ -279,22 +280,27 @@ impl EventMonitor {
                             &ib_messages,
                             &eb_messages,
                             &vote_messages,
+                            &vote_wire,
                             &vote_timing,
                             &pbo,
                         );
                     }
                 }
                 Event::Slot { .. } => {}
-                Event::CpuTaskScheduled { task_type, .. } => {
-                    // Verification is counted where the work is actually
-                    // scheduled.  Deriving it from arrivals minus duplicates
+                Event::CpuTaskScheduled { .. } => {}
+                Event::CpuTaskFinished { task_type, .. } => {
+                    // Verification is counted where the work actually
+                    // finishes.  Deriving it from arrivals minus duplicates
                     // is wrong for every transport that only discovers a copy
-                    // is redundant after verifying it.
+                    // is redundant after verifying it; counting it at
+                    // scheduling is wrong the other way, since a task queued
+                    // behind the node's core limit has cost nothing yet and
+                    // need never run at all -- and the arm whose thesis is
+                    // CPU cost is exactly the one that would inflate.
                     if task_type == VOTE_VALIDATION_TASK {
                         vote_messages.verifications += 1;
                     }
                 }
-                Event::CpuTaskFinished { .. } => {}
                 Event::Cpu { .. } => {}
                 Event::TXGenerated { id, size_bytes, .. } => {
                     txs.insert(id, Transaction::new(size_bytes, time));
@@ -528,8 +534,17 @@ impl EventMonitor {
                 Event::VTBundleNotGenerated { reason, .. } => {
                     *no_vote_reasons.entry(reason).or_default() += 1;
                 }
-                Event::VTBundleSent { .. } => {
+                Event::VTBundleSent { msg_size_bytes, .. } => {
                     vote_messages.sent += 1;
+                    vote_wire.body_bytes += msg_size_bytes;
+                }
+                Event::VTBundleAnnounced { msg_size_bytes, .. } => {
+                    vote_wire.announcements += 1;
+                    vote_wire.announcement_bytes += msg_size_bytes;
+                }
+                Event::VTBundleRequested { msg_size_bytes, .. } => {
+                    vote_wire.requests += 1;
+                    vote_wire.request_bytes += msg_size_bytes;
                 }
                 Event::VTBundleReceived { id, recipient, .. } => {
                     vote_messages.received += 1;
@@ -639,6 +654,7 @@ impl EventMonitor {
             &ib_messages,
             &eb_messages,
             &vote_messages,
+            &vote_wire,
             &vote_timing,
             &pbo,
         );
@@ -692,6 +708,7 @@ impl EventMonitor {
         ib_messages: &MessageStats,
         eb_messages: &MessageStats,
         vote_messages: &MessageStats,
+        vote_wire: &VoteWireStats,
         vote_timing: &VoteTiming,
         pbo: &Option<PrettyBytesOptions>,
     ) {
@@ -932,11 +949,17 @@ impl EventMonitor {
                 );
                 if let (Some(dist), Some(diffusion), Some((margin_mean, margin_worst))) = (
                     outcome.dist.as_ref(),
-                    outcome.diffusion_s(window),
+                    outcome.diffusion_mean_s,
                     outcome.margin_s(window),
                 ) {
+                    // The diffusion figure is a mean of per-EB parts, not a
+                    // slice off the mean, so it is worded as its own average
+                    // rather than as a decomposition of the one before it:
+                    // the two do not subtract whenever any EB reached a
+                    // quorum before the gate, which happens because a
+                    // producer votes for its own block without waiting.
                     line.push_str(&format!(
-                        " Average {:.3}s from t0 (median {:.3}, p95 {:.3}, max {:.3}), of which {diffusion:.3}s was vote diffusion past the gate; margin against the deadline averaged {margin_mean:+.3}s and was {margin_worst:+.3}s at worst.",
+                        " Average {:.3}s from t0 (median {:.3}, p95 {:.3}, max {:.3}); the part of each EB's wait that fell after the gate averaged {diffusion:.3}s; margin against the deadline averaged {margin_mean:+.3}s and was {margin_worst:+.3}s at worst.",
                         dist.mean, dist.median, dist.p95, dist.max,
                     ));
                 }
@@ -949,18 +972,8 @@ impl EventMonitor {
                 arrivals.count, arrivals.mean, arrivals.median, arrivals.p95, arrivals.max,
             ));
         }
-        if let Some(coverage) = compute_dist(vote_timing.coverage_delays()) {
-            lines.push(format!(
-                "Each vote took an average of {:.3}s (median {:.3}, p95 {:.3}, max {:.3}) to reach 95% of nodes ({} of {}); {} out of {} vote bundle(s) never did.",
-                coverage.mean,
-                coverage.median,
-                coverage.p95,
-                coverage.max,
-                vote_timing.coverage_target,
-                vote_timing.node_count,
-                vote_timing.bundles.len().saturating_sub(coverage.count),
-                vote_timing.bundles.len(),
-            ));
+        if let Some(line) = vote_timing.coverage_line() {
+            lines.push(line);
         }
         lines.push(format!(
             "{} L1 block(s) had a Leios endorsement.",
@@ -1019,7 +1032,13 @@ impl EventMonitor {
             lines.push(ib_messages.summary_line("IB"));
         }
         lines.push(eb_messages.summary_line("EB"));
-        lines.push(vote_messages.summary_line("Vote"));
+        // "Vote body", not "Vote": the count is bodies and always was, and
+        // the announcements and requests on the same mini-protocol are on
+        // the line below rather than folded into it.
+        lines.push(vote_messages.summary_line("Vote body"));
+        if !vote_wire.is_empty() {
+            lines.push(vote_wire.summary_line(vote_messages.sent));
+        }
         info_span!("network").in_scope(|| info!("{}\n  {}", network_header, lines.join("\n  ")));
     }
 }
@@ -1114,11 +1133,14 @@ struct MessageStats {
     /// later answers away.
     duplicates: u64,
     duplicate_bytes: u64,
-    /// Verifications actually scheduled for arrivals of this item.  Counted
-    /// where the CPU task is scheduled rather than derived as
-    /// `received - duplicates`: a transport that only recognises a redundant
-    /// copy after verifying it does strictly more work for the same
-    /// delivery, and deriving the figure hides exactly that difference.
+    /// Verifications of arrivals of this item that actually ran to
+    /// completion.  Counted off the CPU task finishing, rather than derived
+    /// as `received - duplicates` or taken off the task being scheduled.
+    /// Deriving it hides the difference the study is about, since a
+    /// transport that only recognises a redundant copy after verifying it
+    /// does strictly more work for the same delivery; counting the
+    /// scheduling reports work that has not been done, because a task can
+    /// sit behind the node's core limit and never run.
     verifications: u64,
 }
 impl MessageStats {
@@ -1129,21 +1151,79 @@ impl MessageStats {
             self.sent, name, self.received, percent_received
         );
         if self.duplicates > 0 || self.verifications > 0 {
+            // Each arrival is reported redundant at most once, so this
+            // cannot exceed the arrivals it is a share of.
             let accepted = self.received.saturating_sub(self.duplicates);
             let percent_duplicate = self.duplicates as f64 / self.received as f64 * 100.0;
             line.push_str(&format!(
                 " {} of those ({:.3}%) were copies the recipient did not need, costing {:.2} MB, \
-                 leaving {} accepted; {} verification(s) were performed ({:.2} per accepted {}).",
+                 leaving {} accepted; {} verification(s) completed",
                 self.duplicates,
                 percent_duplicate,
                 self.duplicate_bytes as f64 / 1e6,
                 accepted,
                 self.verifications,
-                self.verifications as f64 / accepted as f64,
-                name
             ));
+            // Nothing accepted means no rate to quote: printing one divided
+            // by zero as "inf" reads as a measurement rather than as the
+            // absence of one.
+            if accepted > 0 {
+                line.push_str(&format!(
+                    " ({:.2} per accepted {})",
+                    self.verifications as f64 / accepted as f64,
+                    name
+                ));
+            }
+            line.push('.');
         }
         line
+    }
+}
+
+/// What one vote transport spends on the wire to deliver the same votes.
+///
+/// The bodies are the `Vote` counts in `MessageStats`; these are the bytes
+/// behind them, plus the announcement and request messages that the Vote
+/// mini-protocol charges 8 bytes each for and that no counter used to see.
+/// Leaving them out flattered `announce-then-request`, which sends an
+/// announcement per link and a request per body on top of the bodies
+/// themselves, and so sends the most messages of any arm while appearing to
+/// send the fewest.
+#[derive(Default)]
+struct VoteWireStats {
+    /// Bytes of vote bodies sent.
+    body_bytes: u64,
+    announcements: u64,
+    announcement_bytes: u64,
+    requests: u64,
+    request_bytes: u64,
+}
+impl VoteWireStats {
+    /// True when nothing at all went out on the vote mini-protocol.  The
+    /// variants that do not use the bundle path never emit these events,
+    /// and a line of zeroes there would say nothing.
+    fn is_empty(&self) -> bool {
+        self.body_bytes == 0 && self.announcements == 0 && self.requests == 0
+    }
+
+    /// `bodies` is the body count from `MessageStats`, kept as its own
+    /// figure rather than folded into the total, so the number quoted
+    /// before this line existed is still on the page and still means the
+    /// same thing.
+    fn summary_line(&self, bodies: u64) -> String {
+        let total = bodies + self.announcements + self.requests;
+        let total_bytes = self.body_bytes + self.announcement_bytes + self.request_bytes;
+        format!(
+            "Vote mini-protocol traffic sent: {total} message(s), {:.2} MB \
+             = {bodies} bod{} ({:.2} MB) + {} announcement(s) ({:.2} MB) + {} request(s) ({:.2} MB).",
+            total_bytes as f64 / 1e6,
+            if bodies == 1 { "y" } else { "ies" },
+            self.body_bytes as f64 / 1e6,
+            self.announcements,
+            self.announcement_bytes as f64 / 1e6,
+            self.requests,
+            self.request_bytes as f64 / 1e6,
+        )
     }
 }
 
@@ -1165,6 +1245,18 @@ struct QuorumOutcome {
     /// Delay from `t0` to the quorum, in seconds, over the EBs where the
     /// observer ever got one.
     dist: Option<DistStats>,
+    /// Mean over those same EBs of the part of each EB's wait that fell
+    /// after the gate, each floored at zero before the mean is taken.
+    ///
+    /// The flooring has to happen per EB and not on the mean.  A block's
+    /// producer votes for its own block without waiting out its
+    /// equivocation-detection period, so an EB really can reach a quorum
+    /// before the gate, and those EBs contribute zero diffusion rather than
+    /// a negative amount that cancels the diffusion of the EBs that did
+    /// wait.  Flooring the mean instead reported 0.000s of diffusion for
+    /// per-EB delays of 2.0s and 4.0s against a 3.0s gate, where the answer
+    /// is 0.5s.
+    diffusion_mean_s: Option<f64>,
 }
 
 impl QuorumOutcome {
@@ -1174,22 +1266,17 @@ impl QuorumOutcome {
     }
 
     /// Seconds of slack against the voting deadline, on average and at
-    /// worst.  Negative means the quorum turned up after the deadline had
-    /// already passed.
+    /// worst.
+    ///
+    /// Negative means the quorum turned up after the deadline had already
+    /// passed.  Both figures are linear in the per-EB delays -- the mean
+    /// margin is the margin of the mean, and the worst margin is the one
+    /// against the slowest EB -- so unlike the diffusion split they are the
+    /// same computed either way.
     fn margin_s(&self, window: VotingWindow) -> Option<(f64, f64)> {
         let dist = self.dist.as_ref()?;
         let deadline = window.deadline.as_secs_f64();
         Some((deadline - dist.mean, deadline - dist.max))
-    }
-
-    /// Seconds of the average quorum time that were spent on vote
-    /// diffusion, i.e. that fell after the gate.  Floored at zero: the
-    /// producer of an EB votes for it without waiting out its own
-    /// equivocation-detection period, so a single-node quorum could in
-    /// principle land before the gate.
-    fn diffusion_s(&self, window: VotingWindow) -> Option<f64> {
-        let dist = self.dist.as_ref()?;
-        Some((dist.mean - window.gate.as_secs_f64()).max(0.0))
     }
 }
 
@@ -1319,8 +1406,10 @@ impl VoteTiming {
         quantile: f64,
     ) -> QuorumOutcome {
         let mut delays = Vec::new();
+        let mut diffusions = Vec::new();
         let mut in_window = 0;
         let mut by_inclusion = 0;
+        let gate_s = self.window.gate.as_secs_f64();
         for (id, samples) in &self.quorums {
             if !ebs.contains_key(id) {
                 continue;
@@ -1349,11 +1438,22 @@ impl VoteTiming {
                 by_inclusion += 1;
             }
             delays.push(delay.as_secs_f64());
+            // Per EB, and floored here rather than after averaging: see
+            // `QuorumOutcome::diffusion_mean_s`.
+            diffusions.push((delay.as_secs_f64() - gate_s).max(0.0));
         }
+        // Summed in EB order over a `BTreeMap`, so the floating-point result
+        // does not depend on the order the shards reported the crossings in.
+        let diffusion_mean_s = if diffusions.is_empty() {
+            None
+        } else {
+            Some(diffusions.iter().sum::<f64>() / diffusions.len() as f64)
+        };
         QuorumOutcome {
             in_window,
             by_inclusion,
             dist: compute_dist(delays),
+            diffusion_mean_s,
         }
     }
 
@@ -1363,6 +1463,38 @@ impl VoteTiming {
         self.bundles
             .values()
             .filter_map(|b| b.coverage_delay_s(self.coverage_target))
+    }
+
+    /// How many bundles reached 95% of the nodes, how long that took, and
+    /// how many never got there.  `None` only when the run produced no vote
+    /// bundles at all.
+    ///
+    /// The counts sit outside the distribution deliberately.  With them
+    /// inside it, a run where no bundle ever reached 95% of the nodes -- a
+    /// starved or partitioned one, the failure this study exists to
+    /// detect -- printed no line at all, and a missing line reads as
+    /// success.  It is the same reasoning as the quorum counts, which are
+    /// printed whenever there were EBs at all.
+    fn coverage_line(&self) -> Option<String> {
+        if self.bundles.is_empty() {
+            return None;
+        }
+        let coverage = compute_dist(self.coverage_delays());
+        let reached = coverage.as_ref().map_or(0, |c| c.count);
+        let mut line = format!(
+            "{reached} out of {} vote bundle(s) reached 95% of nodes ({} of {}); {} never did.",
+            self.bundles.len(),
+            self.coverage_target,
+            self.node_count,
+            self.bundles.len() - reached,
+        );
+        if let Some(coverage) = coverage {
+            line.push_str(&format!(
+                " Those took an average of {:.3}s (median {:.3}, p95 {:.3}, max {:.3}) to get there.",
+                coverage.mean, coverage.median, coverage.p95, coverage.max,
+            ));
+        }
+        Some(line)
     }
 
     fn arrival_delays(&self) -> Option<DistStats> {
@@ -1734,6 +1866,14 @@ mod tests {
         VoteTiming::new(stakes.len(), stakes, window())
     }
 
+    fn bundle_id(producer: usize) -> VoteBundleId {
+        VoteBundleId {
+            slot: 10,
+            pipeline: 0,
+            producer: node(producer),
+        }
+    }
+
     /// A quorum crossing at `slot` + `ms`, seen by node `index`.
     fn crossed(timing: &mut VoteTiming, slot: u64, index: usize, ms: u64) {
         timing.record_quorum(
@@ -1759,8 +1899,59 @@ mod tests {
         assert_eq!(dist.count, 1);
         assert!((dist.mean - 3.007).abs() < 1e-9, "{}", dist.mean);
         assert!(
-            (outcome.diffusion_s(window()).unwrap() - 0.007).abs() < 1e-9,
+            (outcome.diffusion_mean_s.unwrap() - 0.007).abs() < 1e-9,
             "the vote-diffusion part is what is left after the gate"
+        );
+    }
+
+    /// The diffusion figure is a mean of per-EB parts, each floored at zero,
+    /// and not the mean floored: an EB whose producer's own vote carried it
+    /// past the threshold before the gate contributes nothing to diffusion,
+    /// but it must not cancel out an EB that waited.
+    #[test]
+    fn diffusion_is_floored_per_eb_and_then_averaged() {
+        let mut timing = timing(vec![1]);
+        // 2.0s is before the 3.0s gate, 4.0s is a second past it.
+        crossed(&mut timing, 10, 0, 2000);
+        crossed(&mut timing, 20, 0, 4000);
+        let mut ebs = ebs_at(10, 0);
+        ebs.extend(ebs_at(20, 0));
+        let outcome = timing.quorum_outcome(&ebs, 0.0);
+        assert_eq!(outcome.reached(), 2);
+        assert!(
+            (outcome.dist.as_ref().unwrap().mean - 3.0).abs() < 1e-9,
+            "the two EBs average out to exactly the gate"
+        );
+        let diffusion = outcome.diffusion_mean_s.unwrap();
+        assert!(
+            (diffusion - 0.5).abs() < 1e-9,
+            "(0.0 + 1.0) / 2, not max(3.0 - 3.0, 0.0); got {diffusion}"
+        );
+    }
+
+    /// Every EB before the gate is the case where flooring the mean and
+    /// flooring per EB agree, and both say zero.
+    #[test]
+    fn diffusion_is_zero_when_every_quorum_beat_the_gate() {
+        let mut timing = timing(vec![1]);
+        crossed(&mut timing, 10, 0, 1000);
+        crossed(&mut timing, 20, 0, 2000);
+        let mut ebs = ebs_at(10, 0);
+        ebs.extend(ebs_at(20, 0));
+        let outcome = timing.quorum_outcome(&ebs, 0.0);
+        assert_eq!(outcome.diffusion_mean_s, Some(0.0));
+    }
+
+    #[test]
+    fn an_observer_with_no_quorum_anywhere_reports_no_diffusion_figure() {
+        let mut timing = timing(vec![2, 8]);
+        crossed(&mut timing, 10, 0, 3100);
+        // Only a fifth of the stake ever tallied a quorum, so the median
+        // observer has no EBs to average over -- and no zero to print as if
+        // it had measured one.
+        assert_eq!(
+            timing.quorum_outcome(&ebs_at(10, 0), 0.5).diffusion_mean_s,
+            None
         );
     }
 
@@ -1887,5 +2078,122 @@ mod tests {
         // Two of the twelve units of weight never reported a crossing.
         assert_eq!(weighted_quantile(&samples, 12, 1.0), None);
         assert_eq!(weighted_quantile(&[], 10, 0.0), None);
+    }
+
+    /// The failing case the coverage line exists to report: bundles were
+    /// produced and not one of them got anywhere.  The line has to say so.
+    #[test]
+    fn the_coverage_line_reports_total_failure_instead_of_disappearing() {
+        let mut timing = timing(vec![1; 20]);
+        timing.bundle_generated(bundle_id(0), NodeId::new(0), Timestamp::from_secs(10));
+        timing.bundle_generated(bundle_id(1), NodeId::new(1), Timestamp::from_secs(10));
+        let line = timing.coverage_line().expect("two bundles were produced");
+        assert!(
+            line.starts_with(
+                "0 out of 2 vote bundle(s) reached 95% of nodes (19 of 20); 2 never did."
+            ),
+            "{line}"
+        );
+        assert!(
+            !line.contains("average"),
+            "nothing got there, so there is no time to average: {line}"
+        );
+    }
+
+    #[test]
+    fn the_coverage_line_times_the_bundles_that_did_get_there() {
+        // Four nodes, so 95% coverage means all four of them.
+        let mut timing = timing(vec![1; 4]);
+        timing.bundle_generated(bundle_id(0), NodeId::new(0), Timestamp::from_secs(10));
+        for (node, ms) in [(1, 100), (2, 200), (3, 300)] {
+            timing.bundle_received(
+                &bundle_id(0),
+                NodeId::new(node),
+                Timestamp::from_secs(10) + Duration::from_millis(ms),
+            );
+        }
+        // A second bundle that only ever reaches its own producer.
+        timing.bundle_generated(bundle_id(1), NodeId::new(1), Timestamp::from_secs(10));
+        let line = timing.coverage_line().unwrap();
+        assert!(
+            line.starts_with(
+                "1 out of 2 vote bundle(s) reached 95% of nodes (4 of 4); 1 never did."
+            ),
+            "{line}"
+        );
+        assert!(line.contains("average of 0.300s"), "{line}");
+    }
+
+    #[test]
+    fn there_is_no_coverage_line_when_no_votes_were_cast() {
+        assert_eq!(timing(vec![1; 4]).coverage_line(), None);
+    }
+
+    /// Finding the same arrival redundant twice used to push duplicates past
+    /// received, which saturated accepted to zero and printed a share above
+    /// 100% and an "inf" verification rate.
+    #[test]
+    fn the_message_line_never_reports_more_duplicates_than_arrivals() {
+        let stats = MessageStats {
+            sent: 12,
+            received: 12,
+            duplicates: 4,
+            duplicate_bytes: 4_000_000,
+            verifications: 12,
+        };
+        let line = stats.summary_line("Vote body");
+        assert_eq!(
+            line,
+            "12 Vote body message(s) were sent. 12 of them were received (100.000%). \
+             4 of those (33.333%) were copies the recipient did not need, costing 4.00 MB, \
+             leaving 8 accepted; 12 verification(s) completed (1.50 per accepted Vote body)."
+        );
+    }
+
+    /// A run that verified nothing has no per-accepted rate to report, and
+    /// printing one divided by zero as "inf" reads as a measurement.
+    #[test]
+    fn the_message_line_omits_the_rate_when_nothing_was_accepted() {
+        let stats = MessageStats {
+            sent: 3,
+            received: 0,
+            duplicates: 0,
+            duplicate_bytes: 0,
+            verifications: 2,
+        };
+        let line = stats.summary_line("Vote body");
+        assert!(line.contains("2 verification(s) completed."), "{line}");
+        assert!(!line.contains("inf"), "{line}");
+    }
+
+    /// The comparison finding 3 is about: the same 100 bodies delivered, and
+    /// announce-then-request sends far more messages to do it.
+    #[test]
+    fn the_wire_line_counts_the_control_messages_the_body_count_leaves_out() {
+        let announce = VoteWireStats {
+            body_bytes: 100_000,
+            announcements: 300,
+            announcement_bytes: 2400,
+            requests: 100,
+            request_bytes: 800,
+        };
+        assert_eq!(
+            announce.summary_line(100),
+            "Vote mini-protocol traffic sent: 500 message(s), 0.10 MB = 100 bodies (0.10 MB) \
+             + 300 announcement(s) (0.00 MB) + 100 request(s) (0.00 MB)."
+        );
+        let push = VoteWireStats {
+            body_bytes: 300_000,
+            ..VoteWireStats::default()
+        };
+        assert_eq!(
+            push.summary_line(300),
+            "Vote mini-protocol traffic sent: 300 message(s), 0.30 MB = 300 bodies (0.30 MB) \
+             + 0 announcement(s) (0.00 MB) + 0 request(s) (0.00 MB)."
+        );
+        assert!(
+            VoteWireStats::default().is_empty(),
+            "a variant that sends nothing on the vote protocol prints no line"
+        );
     }
 }

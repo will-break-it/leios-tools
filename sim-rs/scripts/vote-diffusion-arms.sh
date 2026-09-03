@@ -48,11 +48,23 @@ echo "topology=$TOPOLOGY slots=$SLOTS committee=$COMMITTEE seed=$SEED"
 echo "binary=$("$BIN" --version)"
 echo
 
+# The final summary repeats the periodic one, so every figure is taken from
+# the last occurrence of its line.  Bodies and total wire traffic are quoted
+# separately: they are the two numbers the arms differ on, and the body count
+# alone puts the arm that sends the most messages at the top of the table.
+last_line() {
+  echo "$out" | grep -F "$1" | tail -1 | sed 's/^ *//'
+}
+
 for arm in announce push push-late-dedupe push-echo; do
   out=$("$BIN" "$TOPOLOGY" -s "$SLOTS" "${EXTRA[@]}" \
         -p "$SCENARIO" -p "parameters/vote-$arm.yaml" 2>&1 |
         sed 's/\x1b\[[0-9;]*m//g')
-  votes=$(echo "$out" | grep -o '[0-9]* total votes were generated' | tail -1 | awk '{print $1}')
-  printf '%-18s votes=%-7s %s\n' "$arm" "${votes:-?}" \
-    "$(echo "$out" | grep 'Vote message(s)' | tail -1 | sed 's/^ *//')"
+  echo "== $arm =="
+  last_line 'total votes were generated'
+  last_line 'Vote body message(s) were sent'
+  last_line 'Vote mini-protocol traffic sent'
+  last_line 'Quorum at the stake-weighted median node'
+  last_line 'vote bundle(s) reached 95% of nodes'
+  echo
 done

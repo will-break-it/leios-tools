@@ -276,7 +276,14 @@ committee-stake-fraction-threshold: 0.95
 # denominator shrinks to match; that is the expected case, not an error.
 committee-seat-count: 900
 
-# How a vote bundle reaches a peer.
+# Request ordering for vote relay.  Read by the Haskell simulator only; this
+# simulator never looks at it.  Accepted values are "peer-order",
+# "freshest-first" and "oldest-first".  Nothing to do with `vote-transport`
+# below, which is the knob this simulator does read -- the two share this file
+# and nothing else.
+vote-diffusion-strategy: "peer-order"
+
+# How a vote bundle reaches a peer in this simulator.
 #
 #   announce-then-request  announce the bundle id, wait for the peer to ask,
 #                          then send the body.  Each body crosses the network
@@ -300,19 +307,16 @@ committee-seat-count: 900
 #                          broadcast storm that does not terminate.  Kept as the
 #                          evidence that suppression is load-bearing.
 #
-# The legacy values "peer-order", "freshest-first" and "oldest-first" were never
-# read by this simulator and are accepted as aliases of announce-then-request,
-# which is the behaviour the configs that set them actually got.
-# Request ordering for vote relay.  Read by the Haskell simulator, not by this
-# one, which uses `vote-transport` above.
-vote-diffusion-strategy: "peer-order"
-
-# How a vote bundle reaches a peer in this simulator.
+# Those four are the only accepted values.  "peer-order", "freshest-first" and
+# "oldest-first" belong to vote-diffusion-strategy above; they are not aliases
+# of anything here, and setting one of them here fails to load the config.
 vote-transport: "announce-then-request"
 
-# Forward a vote back to the peer it arrived from.  Pure waste, and off here,
+# Push a vote body back to the peer it arrived from.  Pure waste, and off here,
 # but the Haskell node's notify server has no per-peer provenance and so does
-# exactly this.  The option exists to measure that gap.
+# exactly this.  The option exists to measure that gap.  It applies to the push
+# transports only: announce-then-request has no notify server to model, and it
+# is the published baseline, so the flag leaves it alone.
 vote-transport-echo-to-source: false
 
 # Haskell prototype relay mini-protocol parameters.  Not read by this simulator;

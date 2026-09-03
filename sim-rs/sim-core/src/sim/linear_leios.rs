@@ -27,7 +27,7 @@ use crate::{
     },
     rng::{DrawSite, Rng},
     sim::{
-        NodeImpl,
+        NodeImpl, SimMessage as _,
         linear_leios::attackers::{EBWithholdingEvent, EBWithholdingSender},
         linear_wire::{CpuTask, Message, TimedEvent},
         lottery::{LotteryConfig, LotteryKind, MockLotteryResults, vrf_probabilities},
@@ -115,10 +115,21 @@ struct NodeLeiosState {
     vote_weight_by_eb: BTreeMap<EndorserBlockId, u64>,
     /// EBs this node has already seen reach quorum, so the crossing is
     /// reported once per (node, EB).
+    ///
+    /// This set alone cannot carry that guarantee, because pruning drops
+    /// its entries along with the rest of a pruned EB's state.  What
+    /// carries it past a prune is `pruned_ebs`: `count_votes` refuses to
+    /// count into a tombstoned EB at all, so an EB's entry is only ever
+    /// removed from here once nothing can put it back.
     quorum_reached_ebs: BTreeSet<EndorserBlockId>,
     endorsed_ebs: BTreeMap<EndorserBlockId, u64>,
     incomplete_onchain_ebs: BTreeSet<EndorserBlockId>,
     missing_txs: BTreeMap<TransactionId, Vec<EndorserBlockId>>,
+    /// EBs whose state has been pruned.  A tombstone rather than a plain
+    /// deletion, so the paths that would otherwise rebuild that state from
+    /// a late arrival -- header announcements, on-chain endorsements, and
+    /// vote counting -- can tell "never seen" from "seen and finished
+    /// with".
     pruned_ebs: BTreeSet<EndorserBlockId>,
 }
 
@@ -1627,12 +1638,22 @@ impl LinearLeiosNode {
     /// Send a vote bundle onwards to consumers.
     ///
     /// `from` is the peer it arrived from, and is skipped unless
-    /// `vote-diffusion-echo-to-source` is set; `None` when we produced it.
-    /// Under `announce-then-request` this sends the 8-byte id and the peer
-    /// asks for the body; under the push strategies it sends the body.
+    /// `vote-diffusion-echo-to-source` is set on a push transport; `None`
+    /// when we produced it.  Under `announce-then-request` this sends the
+    /// 8-byte id and the peer asks for the body; under the push strategies
+    /// it sends the body.
     fn diffuse_vote_bundle(&mut self, id: VoteBundleId, from: Option<NodeId>) {
         let push = self.sim_config.vote_transport.is_push();
-        let echo = self.sim_config.vote_transport_echo_to_source;
+        // The echo is a push-path artefact: it models the Haskell node's
+        // notify server, which pushes bodies and has no per-peer
+        // provenance to exclude the sender with.  The announce path has
+        // no such server and no such gap, and re-announcing to the peer
+        // that just handed us the body only buys a request and a second
+        // copy of a bundle we are holding.  Leaving the guard outside the
+        // push branch silently made the flag change
+        // `announce-then-request` -- the published baseline -- which is
+        // both undocumented and a behaviour nobody asked to measure.
+        let echo = push && self.sim_config.vote_transport_echo_to_source;
         let body = if push {
             match self.leios.votes.get(&id) {
                 Some(VoteBundleView::Received { votes }) => Some(votes.clone()),
@@ -1651,7 +1672,16 @@ impl LinearLeiosNode {
                     self.tracker.track_votes_sent(votes, self.id, *peer);
                     self.queued.send_to(*peer, Message::Votes(votes.clone()));
                 }
-                None => self.queued.send_to(*peer, Message::AnnounceVotes(id)),
+                None => {
+                    let announcement = Message::AnnounceVotes(id);
+                    self.tracker.track_votes_announced(
+                        id,
+                        self.id,
+                        *peer,
+                        announcement.bytes_size(),
+                    );
+                    self.queued.send_to(*peer, announcement);
+                }
             }
         }
     }
@@ -1666,7 +1696,10 @@ impl LinearLeiosNode {
         };
         if should_request {
             self.leios.votes.insert(id, VoteBundleView::Requested);
-            self.queued.send_to(from, Message::RequestVotes(id));
+            let request = Message::RequestVotes(id);
+            self.tracker
+                .track_votes_requested(id, self.id, from, request.bytes_size());
+            self.queued.send_to(from, request);
         }
     }
 
@@ -1697,14 +1730,18 @@ impl LinearLeiosNode {
                 Some(VoteBundleView::Requested) => strategy.suppresses_in_flight(),
                 None => false,
             };
-        if already_have {
-            // Report the redundant arrival whatever we do with it next:
-            // `push-no-dedupe` forwards it, and the point of that arm is
-            // that the copies it re-sends are visible in the accounting.
+        if already_have && !strategy.forwards_duplicates() {
+            // Dropped here, so here is where this arrival is reported.  An
+            // arrival is reported exactly once: an arm that forwards its
+            // duplicates instead of dropping them goes on to validate this
+            // one, and `finish_validating_vote_bundle` reports it there,
+            // once the verification it did not need has been paid for.
+            // Reporting in both places made `push-no-dedupe` count every
+            // duplicate twice, which drove duplicates past received,
+            // saturated accepted to zero, and printed a duplicate share
+            // above 100% and an "inf" verification rate.
             self.tracker.track_votes_duplicate(&votes, from, self.id);
-            if !strategy.forwards_duplicates() {
-                return;
-            }
+            return;
         }
         if strategy.suppresses_in_flight() {
             // Mark it in flight so copies arriving while this one validates
@@ -1733,10 +1770,13 @@ impl LinearLeiosNode {
         if already_held {
             // A copy we paid to verify and did not need: under
             // `push-late-dedupe` one that arrived inside the validation
-            // window, and under `request-from-all` a second answer to the
-            // same bundle requested from every peer that announced it.
+            // window, under `request-from-all` a second answer to the same
+            // bundle requested from every peer that announced it, and under
+            // `push-no-dedupe` every copy of a bundle already held, since
+            // that arm forwards rather than drops them and so reaches here.
             // The verification is already spent; counting it here is what
-            // keeps those arms from looking cheaper than they are.
+            // keeps those arms from looking cheaper than they are, and it
+            // is the only place they are counted.
             self.tracker.track_votes_duplicate(&votes, from, self.id);
             if !self.sim_config.vote_transport.forwards_duplicates() {
                 return;
@@ -1749,6 +1789,27 @@ impl LinearLeiosNode {
 
     fn count_votes(&mut self, votes: &VoteBundle) {
         for (eb_id, count) in votes.ebs.iter() {
+            if self.leios.pruned_ebs.contains(eb_id) {
+                // Pruning drops this EB's tally *and* the record that its
+                // quorum was already reported, so counting a late bundle
+                // into a pruned EB would rebuild the tally from zero,
+                // cross the threshold a second time, and report a second
+                // crossing for the same (node, EB).  The summary reads
+                // each crossing as one observer and weights it by that
+                // node's stake, so the same node landing in the sample
+                // twice skews the stake-weighted median and 95th
+                // percentile the study reports.
+                //
+                // The tombstone is what makes "at most once per (node,
+                // EB)" structural rather than merely asserted by the
+                // `quorum_reached_ebs` doc comment: a pruned EB is
+                // already endorsed on-chain and can never be needed
+                // again, so a vote for it is not merely uncounted here,
+                // it is unwanted.  Same guard, same reason, as the
+                // pruned-EB checks on the header-announcement and
+                // endorsement paths.
+                continue;
+            }
             *self
                 .leios
                 .votes_by_eb

@@ -343,9 +343,13 @@ pub struct RawParameters {
     pub committee_selection_algorithm: CommitteeSelectionAlgorithm,
     #[serde(default)]
     pub vote_transport: VoteTransport,
-    /// Forward a vote back to the peer it arrived from.  Pure waste, and off
-    /// by default, but the Haskell node's notify server has no per-peer
+    /// Push a vote body back to the peer it arrived from.  Pure waste, and
+    /// off by default, but the Haskell node's notify server has no per-peer
     /// provenance and so does exactly this.
+    ///
+    /// Applies to the push transports only.  `announce-then-request` has no
+    /// notify server to model, and it is the published baseline, so the flag
+    /// leaves it alone rather than adding a round trip on every link.
     #[serde(default)]
     pub vote_transport_echo_to_source: bool,
     #[serde(default = "default_committee_stake_fraction_threshold")]
@@ -1701,11 +1705,26 @@ impl SimConfiguration {
                     .collect()
             }
             CommitteeSelectionAlgorithm::TopStakeSeats => {
-                if matches!(params.leios_variant, LeiosVariant::SharedConsensus) {
+                // Only the linear node reads `committee_selection` when it
+                // decides whether and with what weight it votes; the
+                // short/full family and shared-consensus each run their own
+                // lottery and ignore the seating entirely.  Seating a
+                // committee they do not consult while setting a seat-based
+                // quorum denominator they are measured against produces
+                // certification numbers that mean nothing, so every variant
+                // that does not honour the mode is rejected rather than only
+                // the one that was noticed first.
+                if !matches!(
+                    params.leios_variant,
+                    LeiosVariant::Linear | LeiosVariant::LinearWithTxReferences
+                ) {
                     bail!(
                         "committee-selection-algorithm 'top-stake-seats' is implemented for \
-                         the linear Leios variants only; shared-consensus has no seat-count \
-                         committee mode"
+                         the linear Leios variants only ('linear', \
+                         'linear-with-tx-references'); {:?} runs its own vote lottery and \
+                         would ignore the seating while still being measured against a \
+                         seat-based quorum denominator",
+                        params.leios_variant
                     );
                 }
                 if params.committee_seat_count == 0 {

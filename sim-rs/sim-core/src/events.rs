@@ -80,11 +80,14 @@ pub struct Endorsement<Node: Display = NodeId> {
 }
 
 /// `task_type` carried by the CPU task that verifies a vote bundle.
-/// The run summary counts the scheduling of these tasks to report
-/// verification work directly, instead of deriving it from arrivals minus
-/// duplicates (which is wrong for every transport that verifies a copy it
-/// turns out not to need).  Kept here, next to the event that carries it,
-/// because `sim::linear_wire` is crate-private.
+/// The run summary counts these tasks *finishing* to report verification
+/// work directly, instead of deriving it from arrivals minus duplicates
+/// (which is wrong for every transport that verifies a copy it turns out
+/// not to need).  Scheduling is not the same thing: a task queued behind a
+/// node's core limit has cost nothing yet and may never run at all, so
+/// counting `CpuTaskScheduled` reports work that has not happened.  Kept
+/// here, next to the events that carry it, because `sim::linear_wire` is
+/// crate-private.
 pub const VOTE_VALIDATION_TASK: &str = "ValVote";
 
 #[derive(Debug, Clone, Serialize)]
@@ -299,6 +302,27 @@ pub enum Event {
         recipient: Node,
         msg_size_bytes: u64,
     },
+    /// A vote bundle's id was offered to a peer, without the body.  Costs
+    /// the 8 bytes the Vote mini-protocol charges for it.
+    ///
+    /// `announce-then-request` sends one of these per link and one
+    /// `VTBundleRequested` back for every body it goes on to send, so in
+    /// message count it is the most expensive transport, not the cheapest.
+    /// Nothing counted them before, which is how it came to look cheapest.
+    VTBundleAnnounced {
+        id: VoteBundleId<Node>,
+        sender: Node,
+        recipient: Node,
+        msg_size_bytes: u64,
+    },
+    /// A vote bundle's body was asked for after its id was announced.  Costs
+    /// 8 bytes, like the announcement it answers.
+    VTBundleRequested {
+        id: VoteBundleId<Node>,
+        sender: Node,
+        recipient: Node,
+        msg_size_bytes: u64,
+    },
     /// A vote bundle arrived that the recipient did not need: it already
     /// held the bundle, or it finished verifying a copy of one it had
     /// already accepted.  The bytes were always spent, and under the
@@ -432,7 +456,9 @@ impl Event {
             Self::VTLotteryWon { producer, .. }
             | Self::VTBundleGenerated { producer, .. }
             | Self::VTBundleNotGenerated { producer, .. } => Some(producer.id),
-            Self::VTBundleSent { sender, .. } => Some(sender.id),
+            Self::VTBundleSent { sender, .. }
+            | Self::VTBundleAnnounced { sender, .. }
+            | Self::VTBundleRequested { sender, .. } => Some(sender.id),
             Self::VTBundleReceived { recipient, .. } => Some(recipient.id),
             Self::VTBundleDuplicate { recipient, .. } => Some(recipient.id),
             Self::EBQuorumReached { node, .. } => Some(node.id),
@@ -979,6 +1005,40 @@ impl EventTracker {
             sender: self.to_node(sender),
             recipient: self.to_node(recipient),
             msg_size_bytes: votes.bytes,
+        });
+    }
+
+    /// We offered a peer a bundle's id rather than its body.  `msg_size_bytes`
+    /// is what the Vote mini-protocol charges for the announcement, taken
+    /// from the message itself so the counter cannot drift from the wire.
+    pub fn track_votes_announced(
+        &self,
+        id: VoteBundleId,
+        sender: NodeId,
+        recipient: NodeId,
+        msg_size_bytes: u64,
+    ) {
+        self.send(Event::VTBundleAnnounced {
+            id: self.to_vote_bundle(id),
+            sender: self.to_node(sender),
+            recipient: self.to_node(recipient),
+            msg_size_bytes,
+        });
+    }
+
+    /// We asked a peer for the body of a bundle it announced.
+    pub fn track_votes_requested(
+        &self,
+        id: VoteBundleId,
+        sender: NodeId,
+        recipient: NodeId,
+        msg_size_bytes: u64,
+    ) {
+        self.send(Event::VTBundleRequested {
+            id: self.to_vote_bundle(id),
+            sender: self.to_node(sender),
+            recipient: self.to_node(recipient),
+            msg_size_bytes,
         });
     }
 
