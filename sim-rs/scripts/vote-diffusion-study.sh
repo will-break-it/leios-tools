@@ -4,6 +4,9 @@
 #
 # usage: scripts/vote-diffusion-study.sh <study config.yaml> <output dir> [seed ...]
 #
+# Arms: the four vote transports plus push-fanout, which is push with
+# vote-push-fanout set, the bounded-fanout proposal.
+#
 # <study config.yaml> is ouroboros-leios/analysis/sims/2026w18/experiments/config.yaml.
 # Seeds default to 0.  Each run prints its whole summary to
 # <output dir>/<size>-<arm>-s<seed>.txt; the figures quoted in the PR are the
@@ -47,7 +50,7 @@ for seed in $seeds; do
   for size in 750 1500; do
     topo=$topo750
     [ "$size" = 1500 ] && topo=$topo1500
-    for arm in announce push push-late-dedupe push-echo; do
+    for arm in announce push push-late-dedupe push-echo push-fanout; do
       file=$out/$size-$arm-s$seed.txt
       if "$bin" "$topo" -s 400 \
           -p "$cfg" \
