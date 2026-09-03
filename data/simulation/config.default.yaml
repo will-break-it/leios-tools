@@ -295,12 +295,17 @@ committee-stake-fraction-threshold: 0.95
 # The legacy values "peer-order", "freshest-first" and "oldest-first" were never
 # read by this simulator and are accepted as aliases of announce-then-request,
 # which is the behaviour the configs that set them actually got.
-vote-diffusion-strategy: "announce-then-request"
+# Request ordering for vote relay.  Read by the Haskell simulator, not by this
+# one, which uses `vote-transport` above.
+vote-diffusion-strategy: "peer-order"
+
+# How a vote bundle reaches a peer in this simulator.
+vote-transport: "announce-then-request"
 
 # Forward a vote back to the peer it arrived from.  Pure waste, and off here,
 # but the Haskell node's notify server has no per-peer provenance and so does
 # exactly this.  The option exists to measure that gap.
-vote-diffusion-echo-to-source: false
+vote-transport-echo-to-source: false
 
 # Haskell prototype relay mini-protocol parameters.  Not read by this simulator;
 # kept for parity with the Haskell simulator's configuration.

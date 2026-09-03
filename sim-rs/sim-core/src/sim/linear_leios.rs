@@ -1614,8 +1614,8 @@ impl LinearLeiosNode {
     /// Under `announce-then-request` this sends the 8-byte id and the peer
     /// asks for the body; under the push strategies it sends the body.
     fn diffuse_vote_bundle(&mut self, id: VoteBundleId, from: Option<NodeId>) {
-        let push = self.sim_config.vote_diffusion_strategy.is_push();
-        let echo = self.sim_config.vote_diffusion_echo_to_source;
+        let push = self.sim_config.vote_transport.is_push();
+        let echo = self.sim_config.vote_transport_echo_to_source;
         let body = if push {
             match self.leios.votes.get(&id) {
                 Some(VoteBundleView::Received { votes }) => Some(votes.clone()),
@@ -1667,7 +1667,7 @@ impl LinearLeiosNode {
         // can deliver a body twice; under announce-then-request a node asks for
         // each bundle and the arriving body is the answer, so that path is left
         // exactly as it was.
-        let strategy = self.sim_config.vote_diffusion_strategy;
+        let strategy = self.sim_config.vote_transport;
         let already_have = strategy.is_push()
             && match self.leios.votes.get(&votes.id) {
                 // Fully held: a duplicate under every push strategy.
@@ -1709,7 +1709,7 @@ impl LinearLeiosNode {
         if already_held
             && !self
                 .sim_config
-                .vote_diffusion_strategy
+                .vote_transport
                 .forwards_duplicates()
         {
             return;

@@ -12,7 +12,7 @@ use crate::{
     clock::{Clock, MockClockCoordinator, Timestamp},
     config::{
         CommitteeSelectionAlgorithm, NodeId, RawLinkInfo, RawNode, RawTopology, SimConfiguration,
-        TransactionConfig, VoteDiffusionStrategy,
+        TransactionConfig, VoteTransport,
     },
     events::{Event, EventTracker},
     model::{LinearEndorserBlock, LinearRankingBlock, Transaction, VoteBundle},
@@ -878,8 +878,8 @@ fn announce_then_request_should_not_push_vote_bundle() {
     let node1 = sim.id_for("node-1");
     let node2 = sim.id_for("node-2");
     assert_eq!(
-        sim.config.vote_diffusion_strategy,
-        VoteDiffusionStrategy::AnnounceThenRequest,
+        sim.config.vote_transport,
+        VoteTransport::AnnounceThenRequest,
         "announce-then-request should be the default strategy"
     );
 
@@ -899,7 +899,7 @@ fn push_should_send_vote_bundle_body_directly() {
         ("node-2", new_node(Some(1000), vec!["node-1"])),
     ]);
     let config = new_sim_config_with(topology, |params| {
-        params.vote_diffusion_strategy = VoteDiffusionStrategy::Push;
+        params.vote_transport = VoteTransport::Push;
     });
     let mut sim = TestDriver::new_with_config(config);
     let node1 = sim.id_for("node-1");
@@ -923,7 +923,7 @@ fn push_should_forward_vote_bundle_but_not_to_source() {
         ("node-3", new_node(Some(1000), vec!["node-2"])),
     ]);
     let config = new_sim_config_with(topology, |params| {
-        params.vote_diffusion_strategy = VoteDiffusionStrategy::Push;
+        params.vote_transport = VoteTransport::Push;
     });
     let mut sim = TestDriver::new_with_config(config);
     let node1 = sim.id_for("node-1");
@@ -953,8 +953,8 @@ fn push_should_echo_vote_bundle_to_source_when_configured() {
         ("node-3", new_node(Some(1000), vec!["node-2"])),
     ]);
     let config = new_sim_config_with(topology, |params| {
-        params.vote_diffusion_strategy = VoteDiffusionStrategy::Push;
-        params.vote_diffusion_echo_to_source = true;
+        params.vote_transport = VoteTransport::Push;
+        params.vote_transport_echo_to_source = true;
     });
     let mut sim = TestDriver::new_with_config(config);
     let node1 = sim.id_for("node-1");
@@ -984,7 +984,7 @@ fn push_should_drop_duplicate_vote_bundle() {
         ("node-3", new_node(Some(1000), vec!["node-1", "node-2"])),
     ]);
     let config = new_sim_config_with(topology, |params| {
-        params.vote_diffusion_strategy = VoteDiffusionStrategy::Push;
+        params.vote_transport = VoteTransport::Push;
     });
     let mut sim = TestDriver::new_with_config(config);
     let node1 = sim.id_for("node-1");
@@ -1033,7 +1033,7 @@ fn push_no_dedupe_should_revalidate_duplicate_vote_bundle() {
         ("node-3", new_node(Some(1000), vec!["node-1", "node-2"])),
     ]);
     let config = new_sim_config_with(topology, |params| {
-        params.vote_diffusion_strategy = VoteDiffusionStrategy::PushNoDedupe;
+        params.vote_transport = VoteTransport::PushNoDedupe;
     });
     let mut sim = TestDriver::new_with_config(config);
     let node1 = sim.id_for("node-1");

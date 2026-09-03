@@ -7,7 +7,7 @@
 #
 #   ./scripts/vote-diffusion-arms.sh [-t topology] [-s slots] [-p extra.yaml]...
 #
-# Defaults reproduce the smoke comparison in specs/002-vote-diffusion-strategies.
+# Arms are defined by the parameters/vote-*.yaml overlays.
 # push-no-dedupe is deliberately absent: it does not terminate.
 
 set -euo pipefail

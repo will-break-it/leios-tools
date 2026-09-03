@@ -339,12 +339,12 @@ pub struct RawParameters {
     #[serde(default)]
     pub committee_selection_algorithm: CommitteeSelectionAlgorithm,
     #[serde(default)]
-    pub vote_diffusion_strategy: VoteDiffusionStrategy,
+    pub vote_transport: VoteTransport,
     /// Forward a vote back to the peer it arrived from.  Pure waste, and off
     /// by default, but the Haskell node's notify server has no per-peer
     /// provenance and so does exactly this.
     #[serde(default)]
-    pub vote_diffusion_echo_to_source: bool,
+    pub vote_transport_echo_to_source: bool,
     #[serde(default = "default_committee_stake_fraction_threshold")]
     pub committee_stake_fraction_threshold: f64,
 
@@ -471,18 +471,16 @@ pub enum CommitteeSelectionAlgorithm {
 /// The simulator has only ever done `AnnounceThenRequest`, which delivers
 /// each body exactly once per node.  Both node implementations instead push
 /// bodies inline, bounded by links rather than by nodes.  See
-/// `vote-diffusion-strategy` in `config.default.yaml`.
+/// `vote-transport` in `config.default.yaml`.
+///
+/// Distinct from `vote-diffusion-strategy`, which is a request-ordering knob
+/// read by the Haskell simulator and ignored here; the two live in the same
+/// shared config file and must not be confused.
 #[derive(Debug, Default, Copy, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub enum VoteDiffusionStrategy {
+pub enum VoteTransport {
     /// Announce the id, wait for a request, then send the body.
-    ///
-    /// The aliases are the values of the never-read `vote-diffusion-strategy`
-    /// key that several committed configs still set.  They resolve here
-    /// because this is the behaviour those runs actually got, so the published
-    /// study configs keep parsing and keep their exact semantics.
     #[default]
-    #[serde(alias = "peer-order", alias = "freshest-first", alias = "oldest-first")]
     AnnounceThenRequest,
     /// Push the body straight to peers, forwarding a bundle only the first
     /// time it is seen.  A copy arriving while another is still being
@@ -503,7 +501,7 @@ pub enum VoteDiffusionStrategy {
     PushNoDedupe,
 }
 
-impl VoteDiffusionStrategy {
+impl VoteTransport {
     /// True when bodies are pushed rather than announced.
     pub fn is_push(self) -> bool {
         matches!(self, Self::Push | Self::PushLateDedupe | Self::PushNoDedupe)
@@ -1442,8 +1440,8 @@ pub struct SimConfiguration {
     /// Quorum fraction (CIP-0164 default 0.75).  Compare votes against
     /// `quorum_weight_fraction × expected_total_weight`.
     pub quorum_weight_fraction: f64,
-    pub vote_diffusion_strategy: VoteDiffusionStrategy,
-    pub vote_diffusion_echo_to_source: bool,
+    pub vote_transport: VoteTransport,
+    pub vote_transport_echo_to_source: bool,
     /// Quorum denominator in the units the relevant node implementation
     /// sums per-voter weights.  WfaLs/Everyone: seats or node count.
     /// TopStakeFraction (CIP-164 PR #1196): `total_stake`.
@@ -1676,8 +1674,8 @@ impl SimConfiguration {
             persistent_voters: params.persistent_voters,
             non_persistent_voters: params.non_persistent_voters,
             quorum_weight_fraction: params.quorum_weight_fraction,
-            vote_diffusion_strategy: params.vote_diffusion_strategy,
-            vote_diffusion_echo_to_source: params.vote_diffusion_echo_to_source,
+            vote_transport: params.vote_transport,
+            vote_transport_echo_to_source: params.vote_transport_echo_to_source,
             expected_total_weight,
             vote_slot_length: params.leios_stage_active_voting_slots,
             eb_include_txs_from_previous_stage: params.eb_include_txs_from_previous_stage,

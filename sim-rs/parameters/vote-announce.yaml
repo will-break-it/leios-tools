@@ -2,5 +2,5 @@
 # Layer over a scenario config, e.g.
 #   sim-cli <topology> -p parameters/linear-with-tx-references.yaml \
 #     -p parameters/turbo.yaml -p parameters/vote-announce.yaml
-vote-diffusion-strategy: "announce-then-request"
-vote-diffusion-echo-to-source: false
+vote-transport: "announce-then-request"
+vote-transport-echo-to-source: false
