@@ -79,6 +79,14 @@ pub struct Endorsement<Node: Display = NodeId> {
     pub votes: BTreeMap<Node, usize>,
 }
 
+/// `task_type` carried by the CPU task that verifies a vote bundle.
+/// The run summary counts the scheduling of these tasks to report
+/// verification work directly, instead of deriving it from arrivals minus
+/// duplicates (which is wrong for every transport that verifies a copy it
+/// turns out not to need).  Kept here, next to the event that carries it,
+/// because `sim::linear_wire` is crate-private.
+pub const VOTE_VALIDATION_TASK: &str = "ValVote";
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum Event {
@@ -291,9 +299,11 @@ pub enum Event {
         recipient: Node,
         msg_size_bytes: u64,
     },
-    /// A vote bundle arrived that the recipient already held, so it was
-    /// dropped without validation or forwarding.  The bytes were still spent:
-    /// this is the cost of pushing rather than pulling.
+    /// A vote bundle arrived that the recipient did not need: it already
+    /// held the bundle, or it finished verifying a copy of one it had
+    /// already accepted.  The bytes were always spent, and under the
+    /// transports that only recognise a redundant copy after verifying it
+    /// the signature check was spent too.
     VTBundleDuplicate {
         id: VoteBundleId<Node>,
         producer: Node,
@@ -308,6 +318,17 @@ pub enum Event {
         producer: Node,
         sender: Node,
         recipient: Node,
+    },
+    /// A node's tally of votes for an endorser block first reached the
+    /// quorum threshold.  Emitted once per (node, EB), when the votes are
+    /// counted -- so it is charged the validation the node had to do to get
+    /// there.  The earliest of these is the soonest anyone could certify
+    /// that EB, which is what the voting period has to accommodate.
+    EBQuorumReached {
+        id: EndorserBlockId<Node>,
+        slot: u64,
+        node: Node,
+        votes: u64,
     },
 
     /// CIP-0164 single-vote emission (shared-consensus adapter only — one BLS
@@ -414,6 +435,7 @@ impl Event {
             Self::VTBundleSent { sender, .. } => Some(sender.id),
             Self::VTBundleReceived { recipient, .. } => Some(recipient.id),
             Self::VTBundleDuplicate { recipient, .. } => Some(recipient.id),
+            Self::EBQuorumReached { node, .. } => Some(node.id),
             Self::VoteGenerated { voter, .. } => Some(voter.id),
             Self::VoteSent { sender, .. } => Some(sender.id),
             Self::VoteReceived { recipient, .. } => Some(recipient.id),
@@ -960,7 +982,9 @@ impl EventTracker {
         });
     }
 
-    /// A bundle arrived that we already had.  Records the wasted bytes.
+    /// A bundle arrived that we did not need, either because we already held
+    /// it or because we only found out after verifying it.  Records the
+    /// wasted bytes; the wasted verification shows up in the CPU task count.
     pub fn track_votes_duplicate(&self, votes: &VoteBundle, sender: NodeId, recipient: NodeId) {
         self.send(Event::VTBundleDuplicate {
             id: self.to_vote_bundle(votes.id),
@@ -979,6 +1003,17 @@ impl EventTracker {
             producer: self.to_node(votes.id.producer),
             sender: self.to_node(sender),
             recipient: self.to_node(recipient),
+        });
+    }
+
+    /// This node's tally for `eb` has just reached the quorum threshold.
+    /// Emitted once per (node, EB).
+    pub fn track_eb_quorum_reached(&self, node: NodeId, eb: EndorserBlockId, votes: u64) {
+        self.send(Event::EBQuorumReached {
+            id: self.to_endorser_block(eb),
+            slot: eb.slot,
+            node: self.to_node(node),
+            votes,
         });
     }
 

@@ -10,8 +10,8 @@ use pretty_bytes_rust::{PrettyBytesOptions, pretty_bytes};
 use serde::Serialize;
 use sim_core::{
     clock::Timestamp,
-    config::{LeiosVariant, NodeId, SimConfiguration},
-    events::{BlockRef, Event, Node},
+    config::{LeiosVariant, NodeId, SimConfiguration, VotingWindow},
+    events::{BlockRef, Event, Node, VOTE_VALIDATION_TASK},
     model::{BlockId, NoVoteReason, TransactionId, TransactionLostReason},
 };
 use tokio::{
@@ -46,6 +46,15 @@ pub struct EventMonitor {
     variant: LeiosVariant,
     node_ids: Vec<NodeId>,
     pool_ids: Vec<NodeId>,
+    /// Stake per node, indexed by node id.  The quorum-timing
+    /// distribution is weighted by it, because the certificate is built by
+    /// a ranking block producer and ranking block producers are drawn by
+    /// stake.
+    node_stake: Vec<u64>,
+    /// When voting may start, when it must be over, and when a
+    /// certificate may first be included -- all as offsets from the slot
+    /// of the ranking block that announced the EB.
+    voting_window: VotingWindow,
     maximum_ib_age: u64,
     maximum_eb_age: u64,
     vote_threshold: u64,
@@ -68,10 +77,18 @@ impl EventMonitor {
             .collect();
         let stage_length = config.stage_length;
         let maximum_ib_age = stage_length * 3;
+        let mut node_stake = vec![0u64; config.nodes.len()];
+        for node in &config.nodes {
+            if let Some(stake) = node_stake.get_mut(node.id.to_inner()) {
+                *stake = node.stake;
+            }
+        }
         Self {
             variant: config.variant,
             node_ids,
             pool_ids,
+            node_stake,
+            voting_window: config.voting_window(),
             maximum_ib_age,
             maximum_eb_age: config.max_eb_age,
             vote_threshold: config.vote_threshold(),
@@ -97,6 +114,11 @@ impl EventMonitor {
         let mut votes_per_pool: BTreeMap<NodeId, f64> =
             self.pool_ids.iter().copied().map(|id| (id, 0.0)).collect();
         let mut eb_votes: BTreeMap<EndorserBlockId, f64> = BTreeMap::new();
+        let mut vote_timing = VoteTiming::new(
+            self.node_ids.len(),
+            self.node_stake.clone(),
+            self.voting_window,
+        );
 
         let mut last_timestamp = Timestamp::zero();
         let mut total_slots = 0u64;
@@ -257,12 +279,21 @@ impl EventMonitor {
                             &ib_messages,
                             &eb_messages,
                             &vote_messages,
+                            &vote_timing,
                             &pbo,
                         );
                     }
                 }
                 Event::Slot { .. } => {}
-                Event::CpuTaskScheduled { .. } => {}
+                Event::CpuTaskScheduled { task_type, .. } => {
+                    // Verification is counted where the work is actually
+                    // scheduled.  Deriving it from arrivals minus duplicates
+                    // is wrong for every transport that only discovers a copy
+                    // is redundant after verifying it.
+                    if task_type == VOTE_VALIDATION_TASK {
+                        vote_messages.verifications += 1;
+                    }
+                }
                 Event::CpuTaskFinished { .. } => {}
                 Event::Cpu { .. } => {}
                 Event::TXGenerated { id, size_bytes, .. } => {
@@ -485,6 +516,7 @@ impl EventMonitor {
                 }
                 Event::VTLotteryWon { .. } => {}
                 Event::VTBundleGenerated { id, votes, .. } => {
+                    vote_timing.bundle_generated(id.clone(), id.producer.id, time);
                     for (eb, count) in votes.0 {
                         total_votes += count as u64;
                         *votes_per_bundle.entry(id.clone()).or_default() += count as f64;
@@ -499,8 +531,12 @@ impl EventMonitor {
                 Event::VTBundleSent { .. } => {
                     vote_messages.sent += 1;
                 }
-                Event::VTBundleReceived { .. } => {
+                Event::VTBundleReceived { id, recipient, .. } => {
                     vote_messages.received += 1;
+                    vote_timing.bundle_received(&id, recipient.id, time);
+                }
+                Event::EBQuorumReached { id, node, .. } => {
+                    vote_timing.record_quorum(id, node.id, time);
                 }
                 Event::VTBundleDuplicate { msg_size_bytes, .. } => {
                     // The arrival was already counted by the VTBundleReceived
@@ -603,6 +639,7 @@ impl EventMonitor {
             &ib_messages,
             &eb_messages,
             &vote_messages,
+            &vote_timing,
             &pbo,
         );
 
@@ -655,6 +692,7 @@ impl EventMonitor {
         ib_messages: &MessageStats,
         eb_messages: &MessageStats,
         vote_messages: &MessageStats,
+        vote_timing: &VoteTiming,
         pbo: &Option<PrettyBytesOptions>,
     ) {
         let mut praos_txs = 0u64;
@@ -836,6 +874,94 @@ impl EventMonitor {
                 self.vote_threshold
             ));
         }
+        // Whether a quorum forms inside the voting period is the question the
+        // vote transports are being compared on, so the summary reports, per
+        // EB, when a node's own tally crossed the threshold -- validation
+        // included, since that is what a node has to do before a vote counts.
+        //
+        // Two things about that measurement are worth stating outright,
+        // because both were wrong before and both flatter the protocol when
+        // they are:
+        //
+        //  * It is measured from t0, the start of the slot of the ranking
+        //    block that announced the EB, which is the only anchor CIP-0164
+        //    gives -- the EB carries no slot of its own.  Measuring from the
+        //    EB being generated instead starts the clock after the producer's
+        //    EB-assembly CPU time, which grows with the EB, and hides most of
+        //    a fixed 3 * L_hdr wait inside a number that is then compared
+        //    against L_vote alone.
+        //  * It is reported per observer rather than as a minimum over nodes.
+        //    A minimum is the luckiest node in the network; the node that
+        //    matters is the ranking block producer that builds the
+        //    certificate, and that pool is drawn by stake.
+        //
+        // Where CIP-0164 is ambiguous the stricter reading is taken, i.e. the
+        // one that makes the protocol look worse: the votes must have
+        // *arrived* by the deadline, not merely have been cast by it.  The
+        // looser reading -- votes may still be in flight until a certificate
+        // could first be included -- is reported next to it rather than
+        // instead of it.  The deadlines are used as wall-clock durations, as
+        // the specification says to; at a one second slot length the "slots"
+        // wording elsewhere in it comes to the same thing.
+        //
+        // Only the linear variants report a node-side quorum crossing, so only
+        // they can say how many EBs got one.  The counts are printed whenever
+        // there were EBs at all, including when the answer is none: "no EB ever
+        // gathered a quorum" is the result this study exists to detect, and a
+        // line that disappears in that case reads as success.
+        let reports_quorum = matches!(
+            self.variant,
+            LeiosVariant::Linear | LeiosVariant::LinearWithTxReferences
+        );
+        if reports_quorum && !ebs.is_empty() {
+            let window = self.voting_window;
+            let gate_s = window.gate.as_secs_f64();
+            let deadline_s = window.deadline.as_secs_f64();
+            let inclusion_s = window.inclusion_deadline.as_secs_f64();
+            lines.push(format!(
+                "Quorum timing runs from t0, the start of the slot of the ranking block that announced the EB: voting opens at the gate t0+3*L_hdr = {gate_s:.3}s, the votes are due by t0+3*L_hdr+L_vote = {deadline_s:.3}s, and a certificate for the EB cannot be included before t0+3*L_hdr+L_vote+L_diff = {inclusion_s:.3}s."
+            ));
+            for (label, quantile) in QUORUM_OBSERVERS {
+                let outcome = vote_timing.quorum_outcome(ebs, *quantile);
+                let mut line = format!(
+                    "Quorum at {label}: {} of {} EB(s) reached one, {} of them by the {deadline_s:.3}s deadline and {} by the {inclusion_s:.3}s inclusion deadline.",
+                    outcome.reached(),
+                    ebs.len(),
+                    outcome.in_window,
+                    outcome.by_inclusion,
+                );
+                if let (Some(dist), Some(diffusion), Some((margin_mean, margin_worst))) = (
+                    outcome.dist.as_ref(),
+                    outcome.diffusion_s(window),
+                    outcome.margin_s(window),
+                ) {
+                    line.push_str(&format!(
+                        " Average {:.3}s from t0 (median {:.3}, p95 {:.3}, max {:.3}), of which {diffusion:.3}s was vote diffusion past the gate; margin against the deadline averaged {margin_mean:+.3}s and was {margin_worst:+.3}s at worst.",
+                        dist.mean, dist.median, dist.p95, dist.max,
+                    ));
+                }
+                lines.push(line);
+            }
+        }
+        if let Some(arrivals) = vote_timing.arrival_delays() {
+            lines.push(format!(
+                "Each of {} vote arrival(s) took an average of {:.3}s (median {:.3}, p95 {:.3}, max {:.3}) to get from the voter to a node.",
+                arrivals.count, arrivals.mean, arrivals.median, arrivals.p95, arrivals.max,
+            ));
+        }
+        if let Some(coverage) = compute_dist(vote_timing.coverage_delays()) {
+            lines.push(format!(
+                "Each vote took an average of {:.3}s (median {:.3}, p95 {:.3}, max {:.3}) to reach 95% of nodes ({} of {}); {} out of {} vote bundle(s) never did.",
+                coverage.mean,
+                coverage.median,
+                coverage.p95,
+                coverage.max,
+                vote_timing.coverage_target,
+                vote_timing.node_count,
+                vote_timing.bundles.len().saturating_sub(coverage.count),
+                vote_timing.bundles.len(),
+            ));
+        }
         lines.push(format!(
             "{} L1 block(s) had a Leios endorsement.",
             leios_blocks_with_endorsements
@@ -980,11 +1106,20 @@ impl EndorserBlock {
 struct MessageStats {
     sent: u64,
     received: u64,
-    /// Arrivals dropped because the recipient already held the item.  Only
-    /// the push vote strategies can produce these; the announce-then-request
-    /// path never delivers a body twice.
+    /// Arrivals the recipient did not need: it already held the item, or it
+    /// finished verifying a copy of one it had already accepted.  The push
+    /// vote transports produce these by design; so does the
+    /// announce-then-request path under `relay-strategy: request-from-all`,
+    /// which asks every peer that announces a bundle and then throws the
+    /// later answers away.
     duplicates: u64,
     duplicate_bytes: u64,
+    /// Verifications actually scheduled for arrivals of this item.  Counted
+    /// where the CPU task is scheduled rather than derived as
+    /// `received - duplicates`: a transport that only recognises a redundant
+    /// copy after verifying it does strictly more work for the same
+    /// delivery, and deriving the figure hides exactly that difference.
+    verifications: u64,
 }
 impl MessageStats {
     fn summary_line(&self, name: &str) -> String {
@@ -993,22 +1128,417 @@ impl MessageStats {
             "{} {} message(s) were sent. {} of them were received ({:.3}%).",
             self.sent, name, self.received, percent_received
         );
-        if self.duplicates > 0 {
-            let accepted = self.received - self.duplicates;
+        if self.duplicates > 0 || self.verifications > 0 {
+            let accepted = self.received.saturating_sub(self.duplicates);
             let percent_duplicate = self.duplicates as f64 / self.received as f64 * 100.0;
-            let copies_per_accepted = self.received as f64 / accepted as f64;
             line.push_str(&format!(
-                " {} of those ({:.3}%) were duplicates costing {:.2} MB; \
-                 {:.2} copies arrived per accepted {}.",
+                " {} of those ({:.3}%) were copies the recipient did not need, costing {:.2} MB, \
+                 leaving {} accepted; {} verification(s) were performed ({:.2} per accepted {}).",
                 self.duplicates,
                 percent_duplicate,
                 self.duplicate_bytes as f64 / 1e6,
-                copies_per_accepted,
+                accepted,
+                self.verifications,
+                self.verifications as f64 / accepted as f64,
                 name
             ));
         }
         line
     }
+}
+
+/// A node's tally for one endorser block crossing the quorum threshold:
+/// when it happened, as a delay from that EB's `t0`, and the weight the
+/// node carries in the distribution.
+#[derive(Clone, Copy, Debug)]
+struct QuorumSample {
+    delay_us: u64,
+    weight: u64,
+}
+
+/// What one observer saw of the run's endorser blocks.
+struct QuorumOutcome {
+    /// EBs where the observer held a quorum by the voting deadline.
+    in_window: usize,
+    /// EBs where it held one by the certificate-inclusion deadline.
+    by_inclusion: usize,
+    /// Delay from `t0` to the quorum, in seconds, over the EBs where the
+    /// observer ever got one.
+    dist: Option<DistStats>,
+}
+
+impl QuorumOutcome {
+    /// EBs where the observer held a quorum at any point in the run.
+    fn reached(&self) -> usize {
+        self.dist.as_ref().map_or(0, |d| d.count)
+    }
+
+    /// Seconds of slack against the voting deadline, on average and at
+    /// worst.  Negative means the quorum turned up after the deadline had
+    /// already passed.
+    fn margin_s(&self, window: VotingWindow) -> Option<(f64, f64)> {
+        let dist = self.dist.as_ref()?;
+        let deadline = window.deadline.as_secs_f64();
+        Some((deadline - dist.mean, deadline - dist.max))
+    }
+
+    /// Seconds of the average quorum time that were spent on vote
+    /// diffusion, i.e. that fell after the gate.  Floored at zero: the
+    /// producer of an EB votes for it without waiting out its own
+    /// equivocation-detection period, so a single-node quorum could in
+    /// principle land before the gate.
+    fn diffusion_s(&self, window: VotingWindow) -> Option<f64> {
+        let dist = self.dist.as_ref()?;
+        Some((dist.mean - window.gate.as_secs_f64()).max(0.0))
+    }
+}
+
+/// Whose view of the quorum the summary reports, as a share of the
+/// network's weight, with the label that share is printed under.
+///
+/// The certificate is built by a ranking block producer -- "only RB
+/// producers create certificates when they are about to produce a new
+/// ranking block" -- and which pool that is comes out of a stake-weighted
+/// lottery, so the quantiles are over stake rather than over nodes.  The
+/// first entry is the old minimum-over-nodes figure, kept because it is
+/// what earlier runs reported, and labelled so nobody mistakes it for the
+/// certifier's view again.
+const QUORUM_OBSERVERS: &[(&str, f64)] = &[
+    (
+        "the first node anywhere (the luckiest node, not the one that certifies)",
+        0.0,
+    ),
+    (
+        "the stake-weighted median node (an even chance the block producer that certifies had it)",
+        0.5,
+    ),
+    (
+        "the 95th-percentile node by stake (all but the slowest twentieth of the stake)",
+        0.95,
+    ),
+];
+
+/// Vote timing for the vote-transport study: how long an EB takes to gather
+/// a quorum, and how long a vote takes to get anywhere.
+struct VoteTiming {
+    node_count: usize,
+    /// Distinct nodes a vote has to reach to count as having reached 95%.
+    coverage_target: usize,
+    /// The voting window every EB gets, as offsets from `t0`.
+    window: VotingWindow,
+    /// Weight each node carries in the quorum-timing distribution: its
+    /// stake, since a certificate is built by a stake-drawn ranking block
+    /// producer.  All ones when no node holds stake, so a stakeless test
+    /// topology degrades to a plain distribution over nodes instead of
+    /// dividing by zero.
+    node_weights: Vec<u64>,
+    total_weight: u64,
+    /// Per EB, one sample per node whose own tally crossed the quorum
+    /// threshold.  The simulator reports each crossing once per (node,
+    /// EB), so a node appears at most once here; the vector is one
+    /// `(delay, weight)` pair per node, i.e. 24 KB per EB at 1500 nodes.
+    quorums: BTreeMap<EndorserBlockId, Vec<QuorumSample>>,
+    bundles: BTreeMap<VoteBundleId, BundleDiffusion>,
+    /// Generation-to-arrival delay of every vote arrival, duplicates
+    /// included: those are arrivals the transport paid for too.
+    arrivals: DelayHistogram,
+}
+
+impl VoteTiming {
+    fn new(node_count: usize, node_weights: Vec<u64>, window: VotingWindow) -> Self {
+        let staked: u64 = node_weights.iter().sum();
+        let (node_weights, total_weight) = if staked == 0 {
+            (vec![1; node_count], node_count as u64)
+        } else {
+            (node_weights, staked)
+        };
+        Self {
+            node_count,
+            coverage_target: (node_count as f64 * 0.95).ceil() as usize,
+            window,
+            node_weights,
+            total_weight,
+            quorums: BTreeMap::new(),
+            bundles: BTreeMap::new(),
+            arrivals: DelayHistogram::default(),
+        }
+    }
+
+    fn bundle_generated(&mut self, id: VoteBundleId, producer: NodeId, generated: Timestamp) {
+        let mut bundle = BundleDiffusion::new(generated, self.node_count);
+        // Its producer holds a bundle from the moment the bundle exists.
+        bundle.record(
+            producer,
+            Duration::ZERO,
+            self.node_count,
+            self.coverage_target,
+        );
+        self.bundles.insert(id, bundle);
+    }
+
+    fn bundle_received(&mut self, id: &VoteBundleId, recipient: NodeId, arrived: Timestamp) {
+        let (node_count, coverage_target) = (self.node_count, self.coverage_target);
+        let Some(bundle) = self.bundles.get_mut(id) else {
+            return;
+        };
+        let delay = elapsed(bundle.generated, arrived);
+        bundle.record(recipient, delay, node_count, coverage_target);
+        self.arrivals.record(delay);
+    }
+
+    /// One node's own tally for `eb` reached the quorum threshold at
+    /// `reached`.
+    ///
+    /// The delay is taken from `t0`, the start of the slot of the ranking
+    /// block that announced the EB, and *not* from the EB being generated.
+    /// The two differ by the producer's EB-assembly CPU time, which grows
+    /// with the EB, so measuring from generation makes a bigger EB look
+    /// like it certifies sooner.  `t0` is also what every deadline in
+    /// CIP-0164 is stated against.
+    fn record_quorum(&mut self, eb: EndorserBlockId, node: NodeId, reached: Timestamp) {
+        let delay = elapsed(VotingWindow::anchor(eb.slot), reached);
+        let weight = self
+            .node_weights
+            .get(node.to_inner())
+            .copied()
+            .unwrap_or_default();
+        self.quorums.entry(eb).or_default().push(QuorumSample {
+            delay_us: delay.as_micros().min(u64::MAX as u128) as u64,
+            weight,
+        });
+    }
+
+    /// What the run looked like to the node at `quantile` of the
+    /// network's weight: for each EB, the delay from `t0` by which nodes
+    /// holding that share of the weight had a quorum.  EBs where that much
+    /// weight never got one are absent from the distribution and are not
+    /// counted as in the window.
+    fn quorum_outcome(
+        &self,
+        ebs: &BTreeMap<EndorserBlockId, EndorserBlock>,
+        quantile: f64,
+    ) -> QuorumOutcome {
+        let mut delays = Vec::new();
+        let mut in_window = 0;
+        let mut by_inclusion = 0;
+        for (id, samples) in &self.quorums {
+            if !ebs.contains_key(id) {
+                continue;
+            }
+            let mut samples = samples.clone();
+            // Sorting on the delay alone is enough for a deterministic
+            // answer: tied samples carry the same delay, and the delay is
+            // the only thing read back out, so the order the shards
+            // reported the crossings in cannot change the result.
+            samples.sort_unstable_by_key(|s| s.delay_us);
+            let Some(delay) = weighted_quantile(&samples, self.total_weight, quantile) else {
+                continue;
+            };
+            // The deadline is treated as one the votes have to have
+            // *arrived* by, not merely to have been cast by.  CIP-0164 is
+            // ambiguous here -- §Step 4 collects the quorum "during the
+            // voting period" while §Vote Propagation gives votes the
+            // diffusion period as well -- and this is the stricter of the
+            // two readings, so it is the one that makes the protocol look
+            // worse.  The looser reading is reported alongside it as the
+            // count against the inclusion deadline.
+            if delay <= self.window.deadline {
+                in_window += 1;
+            }
+            if delay <= self.window.inclusion_deadline {
+                by_inclusion += 1;
+            }
+            delays.push(delay.as_secs_f64());
+        }
+        QuorumOutcome {
+            in_window,
+            by_inclusion,
+            dist: compute_dist(delays),
+        }
+    }
+
+    /// Seconds each vote took to reach 95% of the nodes.  Votes that never
+    /// got that far are absent.
+    fn coverage_delays(&self) -> impl Iterator<Item = f64> + '_ {
+        self.bundles
+            .values()
+            .filter_map(|b| b.coverage_delay_s(self.coverage_target))
+    }
+
+    fn arrival_delays(&self) -> Option<DistStats> {
+        self.arrivals.stats()
+    }
+}
+
+/// How one vote bundle spread.
+///
+/// A percentile needs the samples, so while a bundle is still spreading this
+/// holds one first-arrival delay per node that has it, plus a
+/// one-bit-per-node arrival set: 6.2 KB at 1500 nodes.  Once every node has
+/// it the samples collapse to the single 95%-coverage figure and both
+/// buffers are freed, so what is held tracks the bundles still in flight
+/// (one EB's worth, a few thousand, so tens of MB) rather than every bundle
+/// of the run.  The bound to watch is a bundle that never reaches every
+/// node -- a partitioned node, or the end of the run arriving first -- which
+/// keeps its 6.2 KB until the run ends.
+struct BundleDiffusion {
+    generated: Timestamp,
+    /// First-arrival delay in microseconds, one entry per node holding it.
+    delays: Vec<u32>,
+    /// Bit set of the nodes already counted in `delays`.
+    seen: Vec<u64>,
+    /// Delay by which the bundle had reached 95% of nodes, in microseconds.
+    coverage_us: Option<u32>,
+}
+
+impl BundleDiffusion {
+    fn new(generated: Timestamp, node_count: usize) -> Self {
+        Self {
+            generated,
+            delays: Vec::new(),
+            seen: vec![0; node_count.div_ceil(64)],
+            coverage_us: None,
+        }
+    }
+
+    fn record(&mut self, node: NodeId, delay: Duration, node_count: usize, coverage_target: usize) {
+        let index = node.to_inner();
+        let (word, bit) = (index / 64, 1u64 << (index % 64));
+        // An empty set means every node already had it and the samples have
+        // been reduced; later arrivals are duplicates and add nothing here.
+        let Some(seen) = self.seen.get_mut(word) else {
+            return;
+        };
+        if *seen & bit != 0 {
+            return;
+        }
+        *seen |= bit;
+        self.delays
+            .push(delay.as_micros().min(u32::MAX as u128) as u32);
+        if self.delays.len() >= node_count {
+            self.coverage_us = nth_smallest(&mut self.delays, coverage_target);
+            self.delays = Vec::new();
+            self.seen = Vec::new();
+        }
+    }
+
+    fn coverage_delay_s(&self, coverage_target: usize) -> Option<f64> {
+        if let Some(us) = self.coverage_us {
+            return Some(us as f64 / 1e6);
+        }
+        // Still spreading: read the same figure off the arrivals so far, if
+        // enough of them have happened.
+        let mut delays = self.delays.clone();
+        nth_smallest(&mut delays, coverage_target).map(|us| us as f64 / 1e6)
+    }
+}
+
+/// The delay by which nodes carrying `quantile` of the network's weight
+/// held a quorum, or `None` if that much weight never did.  `samples` must
+/// be sorted by delay.
+///
+/// A `quantile` of zero returns the first sample there is, whatever weight
+/// its node carries: that is the "first node anywhere" figure, and a relay
+/// with no stake getting there first still counts as one.
+fn weighted_quantile(
+    samples: &[QuorumSample],
+    total_weight: u64,
+    quantile: f64,
+) -> Option<Duration> {
+    let target = quantile * total_weight as f64;
+    let mut cumulative = 0u64;
+    for sample in samples {
+        cumulative += sample.weight;
+        if cumulative as f64 >= target {
+            return Some(Duration::from_micros(sample.delay_us));
+        }
+    }
+    None
+}
+
+/// The `k`th smallest sample, 1-based, or `None` if there are fewer than
+/// `k` of them.
+fn nth_smallest(samples: &mut [u32], k: usize) -> Option<u32> {
+    if k == 0 || samples.len() < k {
+        return None;
+    }
+    let (_, nth, _) = samples.select_nth_unstable(k - 1);
+    Some(*nth)
+}
+
+/// One millisecond per bucket, up to two minutes.
+const DELAY_BUCKET_COUNT: usize = 120_000;
+
+/// A bounded distribution of delays.
+///
+/// A 1500-node run produces tens of millions of vote arrivals, far too many
+/// to keep a sample each just to read a percentile off them, so arrivals are
+/// counted into a fixed histogram of 1 ms buckets covering [0s, 120s):
+/// 120_000 u64 buckets, 960 KB, whatever the length of the run.  Anything
+/// slower lands in the last bucket, which only matters if a vote takes two
+/// minutes to arrive -- thirty times the voting period the study is about.
+/// Count, sum and max are exact, so the mean and the max are neither
+/// quantised nor dependent on the order the shards hand their events over;
+/// the median and 95th percentile are exact to the 1 ms bucket.
+struct DelayHistogram {
+    buckets: Box<[u64]>,
+    count: u64,
+    total_us: u128,
+    max_us: u64,
+}
+
+impl Default for DelayHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: vec![0; DELAY_BUCKET_COUNT].into_boxed_slice(),
+            count: 0,
+            total_us: 0,
+            max_us: 0,
+        }
+    }
+}
+
+impl DelayHistogram {
+    fn record(&mut self, delay: Duration) {
+        let us = delay.as_micros().min(u64::MAX as u128) as u64;
+        self.count += 1;
+        self.total_us += us as u128;
+        self.max_us = self.max_us.max(us);
+        let bucket = ((us / 1000) as usize).min(DELAY_BUCKET_COUNT - 1);
+        self.buckets[bucket] += 1;
+    }
+
+    /// Nearest-rank percentile, reported at the middle of the bucket it
+    /// falls in.
+    fn percentile_s(&self, percentile: f64) -> f64 {
+        let rank = (percentile * self.count as f64).ceil().max(1.0) as u64;
+        let mut seen = 0u64;
+        for (bucket, count) in self.buckets.iter().enumerate() {
+            seen += count;
+            if seen >= rank {
+                return (bucket as f64 + 0.5) / 1000.0;
+            }
+        }
+        self.max_us as f64 / 1e6
+    }
+
+    fn stats(&self) -> Option<DistStats> {
+        if self.count == 0 {
+            return None;
+        }
+        Some(DistStats {
+            count: self.count as usize,
+            mean: self.total_us as f64 / self.count as f64 / 1e6,
+            median: self.percentile_s(0.5),
+            p95: self.percentile_s(0.95),
+            max: self.max_us as f64 / 1e6,
+        })
+    }
+}
+
+/// Elapsed time between two points, floored at zero.
+fn elapsed(from: Timestamp, to: Timestamp) -> Duration {
+    if to > from { to - from } else { Duration::ZERO }
 }
 
 struct Stats {
@@ -1022,6 +1552,37 @@ fn compute_stats<Iter: IntoIterator<Item = f64>>(data: Iter) -> Stats {
         mean: v.mean(),
         std_dev: v.population_variance().sqrt(),
     }
+}
+
+struct DistStats {
+    count: usize,
+    mean: f64,
+    median: f64,
+    p95: f64,
+    max: f64,
+}
+
+/// Count, mean, median, 95th percentile and max of a set of samples, all in
+/// seconds.  Every sample is retained, which is affordable because the
+/// callers are bounded by the number of EBs or of vote bundles in the run,
+/// not by the number of vote arrivals (see `DelayHistogram` for that).
+fn compute_dist<Iter: IntoIterator<Item = f64>>(data: Iter) -> Option<DistStats> {
+    let mut samples: Vec<f64> = data.into_iter().collect();
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_by(f64::total_cmp);
+    let rank = |percentile: f64| {
+        let index = (percentile * samples.len() as f64).ceil().max(1.0) as usize - 1;
+        samples[index.min(samples.len() - 1)]
+    };
+    Some(DistStats {
+        count: samples.len(),
+        mean: samples.iter().sum::<f64>() / samples.len() as f64,
+        median: rank(0.5),
+        p95: rank(0.95),
+        max: samples[samples.len() - 1],
+    })
 }
 
 /// Flush all buffered events with timestamp strictly less than `up_to`.
@@ -1115,5 +1676,216 @@ impl OutputTarget {
             Self::None => {}
         };
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use sim_core::{clock::Timestamp, config::NodeId, events::Node};
+
+    use super::*;
+
+    /// The CIP-0164 example parameters: L_hdr = 1s, L_vote = 4s,
+    /// L_diff = 7s, so the gate is at 3s, the votes are due at 7s and a
+    /// certificate may first be included at 14s.
+    fn window() -> VotingWindow {
+        VotingWindow {
+            header_deadline: Duration::from_secs(1),
+            gate: Duration::from_secs(3),
+            deadline: Duration::from_secs(7),
+            inclusion_deadline: Duration::from_secs(14),
+        }
+    }
+
+    fn node(index: usize) -> Node {
+        Node {
+            id: NodeId::new(index),
+            name: Arc::new(format!("node-{index}")),
+        }
+    }
+
+    fn eb_id(slot: u64) -> EndorserBlockId {
+        EndorserBlockId {
+            slot,
+            pipeline: 0,
+            producer: node(0),
+        }
+    }
+
+    /// One EB, generated `after_slot_ms` into its slot, as the monitor
+    /// holds it.
+    fn ebs_at(slot: u64, after_slot_ms: u64) -> BTreeMap<EndorserBlockId, EndorserBlock> {
+        let mut ebs = BTreeMap::new();
+        ebs.insert(
+            eb_id(slot),
+            EndorserBlock::new(
+                Timestamp::from_secs(slot) + Duration::from_millis(after_slot_ms),
+                vec![],
+                vec![],
+                vec![],
+            ),
+        );
+        ebs
+    }
+
+    fn timing(stakes: Vec<u64>) -> VoteTiming {
+        VoteTiming::new(stakes.len(), stakes, window())
+    }
+
+    /// A quorum crossing at `slot` + `ms`, seen by node `index`.
+    fn crossed(timing: &mut VoteTiming, slot: u64, index: usize, ms: u64) {
+        timing.record_quorum(
+            eb_id(slot),
+            NodeId::new(index),
+            Timestamp::from_secs(slot) + Duration::from_millis(ms),
+        );
+    }
+
+    #[test]
+    fn quorum_is_measured_from_the_announcing_slot_not_from_eb_generation() {
+        // The 200-node run that prompted this: the EB was generated 128ms
+        // into slot 70 (its producer's assembly CPU time), and the first
+        // node had a quorum at 73.007s.  Measured from generation that is
+        // 2.879s, which reads as comfortably inside a 4s voting period and
+        // is in fact 3s of equivocation-detection wait plus 7ms of vote
+        // diffusion.
+        let mut timing = timing(vec![1, 1]);
+        crossed(&mut timing, 70, 0, 3007);
+        crossed(&mut timing, 70, 1, 3058);
+        let outcome = timing.quorum_outcome(&ebs_at(70, 128), 0.0);
+        let dist = outcome.dist.as_ref().expect("no quorum recorded");
+        assert_eq!(dist.count, 1);
+        assert!((dist.mean - 3.007).abs() < 1e-9, "{}", dist.mean);
+        assert!(
+            (outcome.diffusion_s(window()).unwrap() - 0.007).abs() < 1e-9,
+            "the vote-diffusion part is what is left after the gate"
+        );
+    }
+
+    #[test]
+    fn margin_is_reported_against_the_full_window_not_the_voting_period() {
+        let mut timing = timing(vec![1]);
+        crossed(&mut timing, 10, 0, 3500);
+        let outcome = timing.quorum_outcome(&ebs_at(10, 0), 0.0);
+        let (mean, worst) = outcome.margin_s(window()).unwrap();
+        // 7s deadline from t0, quorum at 3.5s: 3.5s of slack, not the
+        // 0.5s that comparing against L_vote alone would report.
+        assert!((mean - 3.5).abs() < 1e-9, "{mean}");
+        assert!((worst - 3.5).abs() < 1e-9, "{worst}");
+        assert_eq!(outcome.in_window, 1);
+        assert_eq!(outcome.by_inclusion, 1);
+    }
+
+    #[test]
+    fn a_late_quorum_is_counted_late_and_its_margin_goes_negative() {
+        let mut timing = timing(vec![1]);
+        // Past the 7s voting deadline, inside the 14s inclusion deadline.
+        crossed(&mut timing, 10, 0, 9000);
+        let outcome = timing.quorum_outcome(&ebs_at(10, 0), 0.0);
+        assert_eq!(outcome.reached(), 1);
+        assert_eq!(outcome.in_window, 0, "9s is past the 7s deadline");
+        assert_eq!(outcome.by_inclusion, 1, "but not past the 14s one");
+        let (mean, worst) = outcome.margin_s(window()).unwrap();
+        assert!((mean + 2.0).abs() < 1e-9, "{mean}");
+        assert!((worst + 2.0).abs() < 1e-9, "{worst}");
+    }
+
+    #[test]
+    fn observers_are_quantiles_of_stake_not_of_nodes() {
+        // node-0 is a stakeless relay that hears everything first; the two
+        // pools hold all the stake and get there later.
+        let mut timing = timing(vec![0, 5, 5]);
+        crossed(&mut timing, 10, 0, 1000);
+        crossed(&mut timing, 10, 1, 4000);
+        crossed(&mut timing, 10, 2, 5000);
+        let ebs = ebs_at(10, 0);
+        let at = |q: f64| timing.quorum_outcome(&ebs, q).dist.unwrap().mean;
+        assert!(
+            (at(0.0) - 1.0).abs() < 1e-9,
+            "the luckiest node, relay or not"
+        );
+        assert!(
+            (at(0.5) - 4.0).abs() < 1e-9,
+            "half the stake only has it once the first pool does"
+        );
+        assert!((at(0.95) - 5.0).abs() < 1e-9, "and 95% of it once both do");
+    }
+
+    #[test]
+    fn an_observer_that_never_gets_a_quorum_is_not_counted_as_being_in_the_window() {
+        // Only a fifth of the stake ever tallies a quorum.
+        let mut timing = timing(vec![2, 8]);
+        crossed(&mut timing, 10, 0, 3100);
+        let ebs = ebs_at(10, 0);
+        let median = timing.quorum_outcome(&ebs, 0.5);
+        assert_eq!(median.reached(), 0);
+        assert_eq!(median.in_window, 0);
+        assert_eq!(median.by_inclusion, 0);
+        assert!(median.dist.is_none());
+        assert!(median.margin_s(window()).is_none());
+        assert_eq!(timing.quorum_outcome(&ebs, 0.0).reached(), 1);
+    }
+
+    #[test]
+    fn quorum_statistics_do_not_depend_on_the_order_crossings_are_reported() {
+        let stakes = vec![3, 1, 4, 1, 5];
+        let arrivals = [(0, 5000), (1, 3200), (2, 4100), (3, 3050), (4, 6000)];
+        let ebs = ebs_at(10, 90);
+        let mut forwards = timing(stakes.clone());
+        for (node, ms) in arrivals {
+            crossed(&mut forwards, 10, node, ms);
+        }
+        let mut backwards = timing(stakes);
+        for (node, ms) in arrivals.into_iter().rev() {
+            crossed(&mut backwards, 10, node, ms);
+        }
+        for quantile in [0.0, 0.5, 0.95] {
+            let a = forwards.quorum_outcome(&ebs, quantile);
+            let b = backwards.quorum_outcome(&ebs, quantile);
+            assert_eq!(a.in_window, b.in_window);
+            assert_eq!(a.by_inclusion, b.by_inclusion);
+            assert_eq!(
+                a.dist.unwrap().mean.to_bits(),
+                b.dist.unwrap().mean.to_bits(),
+                "bit-identical at quantile {quantile}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_eb_the_monitor_never_saw_generated_is_left_out() {
+        let mut timing = timing(vec![1]);
+        crossed(&mut timing, 10, 0, 3100);
+        let outcome = timing.quorum_outcome(&BTreeMap::new(), 0.0);
+        assert_eq!(outcome.reached(), 0);
+    }
+
+    #[test]
+    fn a_topology_without_stake_weights_every_node_the_same() {
+        let mut timing = timing(vec![0, 0, 0, 0]);
+        for (index, ms) in [(0, 3010), (1, 3020), (2, 3030), (3, 3040)] {
+            crossed(&mut timing, 10, index, ms);
+        }
+        let ebs = ebs_at(10, 0);
+        let median = timing.quorum_outcome(&ebs, 0.5).dist.unwrap().mean;
+        assert!((median - 3.02).abs() < 1e-9, "{median}");
+    }
+
+    #[test]
+    fn weighted_quantile_walks_the_samples_in_delay_order() {
+        let samples = [(1_000_000, 1), (2_000_000, 8), (3_000_000, 1)]
+            .map(|(delay_us, weight)| QuorumSample { delay_us, weight });
+        let at = |q| weighted_quantile(&samples, 10, q);
+        assert_eq!(at(0.0), Some(Duration::from_secs(1)));
+        assert_eq!(at(0.1), Some(Duration::from_secs(1)));
+        assert_eq!(at(0.5), Some(Duration::from_secs(2)));
+        assert_eq!(at(0.9), Some(Duration::from_secs(2)));
+        assert_eq!(at(0.95), Some(Duration::from_secs(3)));
+        assert_eq!(at(1.0), Some(Duration::from_secs(3)));
+        // Two of the twelve units of weight never reported a crossing.
+        assert_eq!(weighted_quantile(&samples, 12, 1.0), None);
+        assert_eq!(weighted_quantile(&[], 10, 0.0), None);
     }
 }

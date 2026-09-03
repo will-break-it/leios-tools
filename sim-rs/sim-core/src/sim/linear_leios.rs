@@ -8,7 +8,6 @@ use std::{
     // iterated in order-sensitive paths, so it does not affect determinism.
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     sync::Arc,
-    time::Duration,
 };
 
 use rand_chacha::ChaChaRng;
@@ -110,6 +109,13 @@ struct NodeLeiosState {
     eb_peer_announcements: BTreeMap<EndorserBlockId, Vec<NodeId>>,
     votes: BTreeMap<VoteBundleId, VoteBundleView>,
     votes_by_eb: BTreeMap<EndorserBlockId, BTreeMap<NodeId, usize>>,
+    /// Running sum of `votes_by_eb`, so a quorum crossing is detected in
+    /// O(1) as each bundle is counted rather than by re-summing every
+    /// voter on every arrival.
+    vote_weight_by_eb: BTreeMap<EndorserBlockId, u64>,
+    /// EBs this node has already seen reach quorum, so the crossing is
+    /// reported once per (node, EB).
+    quorum_reached_ebs: BTreeSet<EndorserBlockId>,
     endorsed_ebs: BTreeMap<EndorserBlockId, u64>,
     incomplete_onchain_ebs: BTreeSet<EndorserBlockId>,
     missing_txs: BTreeMap<TransactionId, Vec<EndorserBlockId>>,
@@ -376,6 +382,8 @@ impl LinearLeiosNode {
             }
             self.leios.endorsed_ebs.remove(eb_id);
             self.leios.votes_by_eb.remove(eb_id);
+            self.leios.vote_weight_by_eb.remove(eb_id);
+            self.leios.quorum_reached_ebs.remove(eb_id);
             self.leios.ebs.remove(eb_id);
             self.leios.eb_peer_announcements.remove(eb_id);
             self.leios.pruned_ebs.insert(*eb_id);
@@ -731,10 +739,10 @@ impl LinearLeiosNode {
 
         let parent = self.latest_rb_id();
         let endorsement = parent.and_then(|rb_id| {
-            let earliest_endorse_time = Timestamp::from_secs(rb_id.slot)
-                + (self.sim_config.header_diffusion_time * 3)
-                + Duration::from_secs(self.sim_config.linear_vote_stage_length)
-                + Duration::from_secs(self.sim_config.linear_diffuse_stage_length);
+            let earliest_endorse_time = self
+                .sim_config
+                .voting_window()
+                .inclusion_deadline_at(rb_id.slot);
 
             if earliest_endorse_time > Timestamp::from_secs(slot) {
                 // This RB was generated too quickly after another; hasn't been time to gather all the votes.
@@ -1484,8 +1492,9 @@ impl LinearLeiosNode {
 // Voting
 impl LinearLeiosNode {
     fn vote_for_endorser_block(&mut self, eb: &Arc<EndorserBlock>, seen: Timestamp) {
-        let equivocation_cutoff_time =
-            Timestamp::from_secs(eb.slot) + (self.sim_config.header_diffusion_time * 3);
+        // CIP-0164 §Equivocation Detection: voting begins 3 * L_hdr after
+        // the slot of the announcing RB, not after the EB was built.
+        let equivocation_cutoff_time = self.sim_config.voting_window().gate_at(eb.slot);
         if eb.producer != self.id && self.clock.now() < equivocation_cutoff_time {
             // If we haven't waited long enough to detect equivocations,
             // schedule voting later.
@@ -1531,6 +1540,16 @@ impl LinearLeiosNode {
                     0
                 }
             }
+            // CIP-0164 seat-count committee: a seated pool holds exactly
+            // one seat and votes with weight 1.  The receiver compares
+            // the sum against `quorum_weight_fraction × seats filled`.
+            CommitteeSelectionAlgorithm::TopStakeSeats => {
+                if self.sim_config.vote_eligible_nodes.contains(&self.id) {
+                    1
+                } else {
+                    0
+                }
+            }
         };
         if vrf_wins == 0 {
             return false;
@@ -1562,9 +1581,7 @@ impl LinearLeiosNode {
     }
 
     fn should_vote_for(&self, eb: &EndorserBlock, seen: Timestamp) -> Result<(), NoVoteReason> {
-        let eb_must_be_received_by = Timestamp::from_secs(eb.slot)
-            + (self.sim_config.header_diffusion_time * 3)
-            + Duration::from_secs(self.sim_config.linear_vote_stage_length);
+        let eb_must_be_received_by = self.sim_config.voting_window().deadline_at(eb.slot);
         if seen > eb_must_be_received_by {
             // An EB must be received within L_vote slots of its creation.
             return Err(NoVoteReason::LateEB);
@@ -1578,7 +1595,7 @@ impl LinearLeiosNode {
             return Err(NoVoteReason::WrongEB);
         }
         let rb_header_must_be_received_by =
-            Timestamp::from_secs(eb.slot) + self.sim_config.header_diffusion_time;
+            self.sim_config.voting_window().header_deadline_at(eb.slot);
         if header_seen >= rb_header_must_be_received_by {
             // The RB header must be received more quickly
             return Err(NoVoteReason::LateRBHeader);
@@ -1664,9 +1681,11 @@ impl LinearLeiosNode {
         self.tracker.track_votes_received(&votes, from, self.id);
         // A bundle already held costs nothing beyond the bytes: real nodes test
         // the seen-set rather than verifying again.  Only the push strategies
-        // can deliver a body twice; under announce-then-request a node asks for
-        // each bundle and the arriving body is the answer, so that path is left
-        // exactly as it was.
+        // can recognise a redundant body this early; the announce path has
+        // already asked for the body it is being handed, so a copy it did not
+        // need is only discovered after validating it (see
+        // `finish_validating_vote_bundle`), and that path is left exactly as
+        // it was.
         let strategy = self.sim_config.vote_transport;
         let already_have = strategy.is_push()
             && match self.leios.votes.get(&votes.id) {
@@ -1678,9 +1697,14 @@ impl LinearLeiosNode {
                 Some(VoteBundleView::Requested) => strategy.suppresses_in_flight(),
                 None => false,
             };
-        if already_have && !strategy.forwards_duplicates() {
+        if already_have {
+            // Report the redundant arrival whatever we do with it next:
+            // `push-no-dedupe` forwards it, and the point of that arm is
+            // that the copies it re-sends are visible in the accounting.
             self.tracker.track_votes_duplicate(&votes, from, self.id);
-            return;
+            if !strategy.forwards_duplicates() {
+                return;
+            }
         }
         if strategy.suppresses_in_flight() {
             // Mark it in flight so copies arriving while this one validates
@@ -1706,15 +1730,18 @@ impl LinearLeiosNode {
                 },
             )
             .is_some_and(|v| matches!(v, VoteBundleView::Received { .. }));
-        if already_held
-            && !self
-                .sim_config
-                .vote_transport
-                .forwards_duplicates()
-        {
-            return;
-        }
-        if !already_held {
+        if already_held {
+            // A copy we paid to verify and did not need: under
+            // `push-late-dedupe` one that arrived inside the validation
+            // window, and under `request-from-all` a second answer to the
+            // same bundle requested from every peer that announced it.
+            // The verification is already spent; counting it here is what
+            // keeps those arms from looking cheaper than they are.
+            self.tracker.track_votes_duplicate(&votes, from, self.id);
+            if !self.sim_config.vote_transport.forwards_duplicates() {
+                return;
+            }
+        } else {
             self.count_votes(&votes);
         }
         self.diffuse_vote_bundle(id, Some(from));
@@ -1729,6 +1756,15 @@ impl LinearLeiosNode {
                 .or_default()
                 .entry(votes.id.producer)
                 .or_default() += count;
+            let tally = self.leios.vote_weight_by_eb.entry(*eb_id).or_default();
+            *tally += *count as u64;
+            let weight = *tally;
+            if weight >= self.sim_config.vote_threshold()
+                && self.leios.quorum_reached_ebs.insert(*eb_id)
+            {
+                self.tracker
+                    .track_eb_quorum_reached(self.id, *eb_id, weight);
+            }
         }
     }
 }

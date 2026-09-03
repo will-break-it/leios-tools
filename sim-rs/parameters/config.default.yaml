@@ -260,13 +260,21 @@ vote-bundle-size-bytes-per-eb: 105
 # = 0.6 × 500 = 300. Keep in sync with quorum-weight-fraction above.
 vote-threshold: 300
 
-# Committee selection algorithm: "wfa-ls" (default), "everyone", or "top-stake-fraction"
+# Committee selection algorithm: "wfa-ls" (default), "everyone",
+# "top-stake-fraction" or "top-stake-seats".
 # The same `quorum-weight-fraction` knob applies to all modes; the
 # absolute threshold is derived from it via the mode-specific
 # denominator (see above).
 committee-selection-algorithm: "wfa-ls"
 # Fraction of total stake eligible to vote when using "top-stake-fraction".
 committee-stake-fraction-threshold: 0.95
+# Committee size in seats when using "top-stake-seats". CIP-0164 governs the
+# committee by seat count and recommends 900. The top `committee-seat-count`
+# stake-holding pools are seated, ties broken by pool identifier ascending,
+# and each seat votes with weight 1. A topology with fewer stake-holding
+# pools than seats requested seats every pool it has, and the quorum
+# denominator shrinks to match; that is the expected case, not an error.
+committee-seat-count: 900
 
 # How a vote bundle reaches a peer.
 #
