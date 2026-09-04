@@ -23,6 +23,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use crate::{
     clock::Timestamp,
     config::{CpuTimeConfig, NodeId},
+    events::VOTE_VALIDATION_TASK,
     model::{
         BlockId, EndorserBlockId, LinearEndorserBlock as EndorserBlock,
         LinearRankingBlock as RankingBlock, LinearRankingBlockHeader as RankingBlockHeader,
@@ -201,9 +202,9 @@ impl SimCpuTask for CpuTask {
             Self::EBHeaderValidated(_, _) => "ValEH",
             Self::EBBlockValidated(_, _) => "ValEB",
             Self::VTBundleGenerated(_, _) => "GenVote",
-            Self::VTBundleValidated(_, _) => "ValVote",
+            Self::VTBundleValidated(_, _) => VOTE_VALIDATION_TASK,
             Self::VoteGenerated(_) => "GenVote",
-            Self::VoteValidated(_, _) => "ValVote",
+            Self::VoteValidated(_, _) => VOTE_VALIDATION_TASK,
             Self::RBBlockApplied(_) => "AppRB",
             Self::EBBlockApplied(_) => "AppEB",
         }

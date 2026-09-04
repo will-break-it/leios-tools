@@ -180,6 +180,47 @@ impl TraceAggregator {
             Event::VTBundleReceived { id, recipient, .. } => {
                 self.track_data_received(MessageId::Votes(id), recipient);
             }
+            Event::VTBundleDuplicate {
+                recipient,
+                msg_size_bytes,
+                ..
+            } => {
+                // Every arrival, redundant or not, already went through
+                // `VTBundleReceived`, so this is recorded as its own figure
+                // rather than added to the received totals: `redundant` is
+                // the share of `received` the recipient did not need, and
+                // the two must not be summed.  Without it the aggregate
+                // stream cannot tell the push arms from the announce arm,
+                // since what separates them is precisely the copies.
+                self.track_redundant(MessageKind::Votes, recipient, msg_size_bytes);
+            }
+            Event::VTBundleAnnounced {
+                sender,
+                recipient,
+                msg_size_bytes,
+                ..
+            }
+            | Event::VTBundleRequested {
+                sender,
+                recipient,
+                msg_size_bytes,
+                ..
+            } => {
+                // The 8-byte control messages on the vote mini-protocol get
+                // their own kind rather than being folded into `votes`, so
+                // counting them cannot silently redefine the body figures a
+                // consumer of this stream already reads.
+                self.track_control(MessageKind::VoteControl, sender, recipient, msg_size_bytes);
+            }
+            Event::EBQuorumReached { node, .. } => {
+                // Not a message, so it has no place in the byte counts: it is
+                // a per-node protocol milestone and is counted as one.  It is
+                // the other half of what tells the vote transports apart, so
+                // letting it fall through the catch-all left `-a` with no way
+                // to show any difference between them.
+                self.nodes_updated.insert(node.clone());
+                self.nodes.entry(node).or_default().quorums_reached += 1;
+            }
             Event::RBGenerated {
                 id,
                 producer,
@@ -226,6 +267,12 @@ impl TraceAggregator {
             Event::RBReceived { id, recipient, .. } => {
                 self.track_data_received(MessageId::PB(id), recipient);
             }
+            // Everything else is either not per-node traffic (slots, CPU
+            // tasks, partitions) or is already covered by the generated /
+            // sent / received event it comes with.  Anything added to
+            // `Event` that a node spends bytes or work on belongs above,
+            // not here: an event that only falls through leaves `-a` unable
+            // to show whatever that event was added to measure.
             _ => {}
         };
         let current_chunk = (self.current_time - Timestamp::zero()).as_millis() / 250;
@@ -307,6 +354,40 @@ impl TraceAggregator {
         stats.bytes += bytes;
         node_data.bytes_received += bytes;
     }
+
+    /// An arrival the recipient did not need.  Already counted in
+    /// `received`; this is a breakdown of it, not an addition to it, so it
+    /// deliberately leaves `bytes_received` alone.
+    fn track_redundant(&mut self, kind: MessageKind, recipient: Node, bytes: u64) {
+        self.nodes_updated.insert(recipient.clone());
+        let stats = self
+            .nodes
+            .entry(recipient)
+            .or_default()
+            .redundant
+            .entry(kind)
+            .or_default();
+        stats.count += 1;
+        stats.bytes += bytes;
+    }
+
+    /// A control message that carries no body of its own, so its size is on
+    /// the event rather than in the `bytes` map keyed by the body's id.
+    fn track_control(&mut self, kind: MessageKind, sender: Node, recipient: Node, bytes: u64) {
+        self.nodes_updated.insert(sender.clone());
+        let sender_data = self.nodes.entry(sender).or_default();
+        let sent = sender_data.sent.entry(kind).or_default();
+        sent.count += 1;
+        sent.bytes += bytes;
+        sender_data.bytes_sent += bytes;
+
+        self.nodes_updated.insert(recipient.clone());
+        let recipient_data = self.nodes.entry(recipient).or_default();
+        let received = recipient_data.received.entry(kind).or_default();
+        received.count += 1;
+        received.bytes += bytes;
+        recipient_data.bytes_received += bytes;
+    }
 }
 
 #[derive(Serialize)]
@@ -327,6 +408,10 @@ enum MessageKind {
     IB,
     EB,
     Votes,
+    /// Announcements and requests on the vote mini-protocol: 8 bytes each,
+    /// no body.  Separate from `Votes` so the body counts keep meaning what
+    /// they always meant.
+    VoteControl,
     PB,
 }
 
@@ -346,6 +431,9 @@ impl MessageId {
             Self::IB(_) => MessageKind::IB,
             Self::EB(_) => MessageKind::EB,
             Self::Votes(_) => MessageKind::Votes,
+            // `MessageKind::VoteControl` has no `MessageId`: announcements
+            // and requests carry their own size, so they never go through
+            // the id-keyed `bytes` map.
             Self::PB(_) => MessageKind::PB,
         }
     }
@@ -366,6 +454,13 @@ struct NodeAggregatedData {
     generated: BTreeMap<MessageKind, u64>,
     sent: BTreeMap<MessageKind, MessageStats>,
     received: BTreeMap<MessageKind, MessageStats>,
+    /// The part of `received` that the node did not need -- a copy of
+    /// something it already held, or one it only found redundant after
+    /// verifying it.  A subset of `received`, never an addition to it.
+    redundant: BTreeMap<MessageKind, MessageStats>,
+    /// Endorser blocks whose vote tally crossed the quorum threshold at this
+    /// node.  Counted once per EB.
+    quorums_reached: u64,
 }
 
 #[derive(Serialize)]

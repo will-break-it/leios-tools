@@ -183,6 +183,11 @@ fn derive_committee_selection(sim_config: &SimConfiguration) -> CommitteeSelecti
         A::TopStakeFraction => CommitteeSelection::StakeCentile {
             top_centile_of_stake: sim_config.committee_stake_fraction_threshold,
         },
+        // shared-consensus has no seat-count committee; `SimConfiguration::build`
+        // rejects this pairing before a node is ever constructed.
+        A::TopStakeSeats => unreachable!(
+            "top-stake-seats is rejected for the shared-consensus variant at config load"
+        ),
     }
 }
 

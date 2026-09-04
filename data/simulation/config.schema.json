@@ -127,11 +127,21 @@
       "type": "object"
     },
     "CommitteeSelectionAlgorithm": {
-      "enum": ["wfa-ls", "everyone", "top-stake-fraction"],
+      "enum": ["wfa-ls", "everyone", "top-stake-fraction", "top-stake-seats"],
       "type": "string"
     },
     "DiffusionStrategy": {
       "enum": ["peer-order", "freshest-first", "oldest-first"],
+      "type": "string"
+    },
+    "VoteTransport": {
+      "description": "How a vote bundle reaches a peer in the Rust simulator.",
+      "enum": [
+        "announce-then-request",
+        "push",
+        "push-late-dedupe",
+        "push-no-dedupe"
+      ],
       "type": "string"
     },
     "Distribution": {
@@ -800,6 +810,19 @@
       "$ref": "#/definitions/DiffusionStrategy",
       "description": "Only supported by Haskell simulation."
     },
+    "vote-transport": {
+      "$ref": "#/definitions/VoteTransport",
+      "description": "How a vote bundle reaches a peer in the Rust simulator: announce-then-request, push, push-late-dedupe, or push-no-dedupe."
+    },
+    "vote-transport-echo-to-source": {
+      "description": "Forward a vote back to the peer it arrived from. Off by default; the Haskell node does this because its notify server has no per-peer provenance.",
+      "type": "boolean"
+    },
+    "vote-push-fanout": {
+      "description": "Push a vote body to at most this many peers instead of every consumer. Unset means every consumer, which is what both node implementations do. A proposal, not a CIP-0164 rule: the specification caps distinct votes relayed per committee member per slot, not copies of one vote. Push transports only.",
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
     "vote-generation-cpu-time-ms-constant": {
       "description": "Grandfathered for Haskell sim.",
       "type": "number"
@@ -842,11 +865,16 @@
     },
     "committee-selection-algorithm": {
       "$ref": "#/definitions/CommitteeSelectionAlgorithm",
-      "description": "Committee selection algorithm. 'wfa-ls' (default) uses VRF lottery. 'everyone' means every node votes. 'top-stake-fraction' selects highest-stake nodes covering committee-stake-fraction-threshold of total stake."
+      "description": "Committee selection algorithm. 'wfa-ls' (default) uses VRF lottery. 'everyone' means every node votes. 'top-stake-fraction' selects highest-stake nodes covering committee-stake-fraction-threshold of total stake. 'top-stake-seats' seats the top committee-seat-count stake-holding pools, each voting with weight 1."
     },
     "committee-stake-fraction-threshold": {
       "description": "Fraction of total stake eligible to vote when committee-selection-algorithm is 'top-stake-fraction'. Default 0.95.",
       "type": "number"
+    },
+    "committee-seat-count": {
+      "description": "Committee size in seats when committee-selection-algorithm is 'top-stake-seats'. The top N stake-holding pools by stake are seated, ties broken by pool identifier ascending, and each casts one vote of weight 1. A topology with fewer stake-holding pools than seats requested seats all of them and the quorum denominator shrinks to match. CIP-0164 recommends 900.",
+      "type": "integer",
+      "minimum": 1
     }
   },
   "type": "object"

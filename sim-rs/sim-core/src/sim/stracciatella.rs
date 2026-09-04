@@ -893,17 +893,30 @@ impl StracciatellaLeiosNode {
             .votes
             .insert(votes.id, VoteBundleView::Received(votes.clone()));
         for peer in &self.consumers {
-            self.queued.send_to(*peer, Message::AnnounceVotes(votes.id));
+            let announcement = Message::AnnounceVotes(votes.id);
+            self.tracker
+                .track_votes_announced(votes.id, self.id, *peer, announcement.bytes_size());
+            self.queued.send_to(*peer, announcement);
         }
     }
 
+    /// The announcement and the request are counted here for the same
+    /// reason they are counted in `linear_leios`: the "Vote mini-protocol
+    /// traffic" line in the run summary adds them to the bodies, and a
+    /// variant that sends them without reporting them makes that line
+    /// state, as a measurement, that it sent none.  This variant announces
+    /// on every link and requests once per body, so the two together
+    /// outnumber the bodies by an order of magnitude.
     fn receive_announce_votes(&mut self, from: NodeId, id: VoteBundleId) {
         if self.leios.votes.get(&id).is_none_or(|v| {
             self.sim_config.relay_strategy == RelayStrategy::RequestFromAll
                 && matches!(v, VoteBundleView::Requested)
         }) {
             self.leios.votes.insert(id, VoteBundleView::Requested);
-            self.queued.send_to(from, Message::RequestVotes(id));
+            let request = Message::RequestVotes(id);
+            self.tracker
+                .track_votes_requested(id, self.id, from, request.bytes_size());
+            self.queued.send_to(from, request);
         }
     }
 
@@ -951,7 +964,10 @@ impl StracciatellaLeiosNode {
             if *peer == from {
                 continue;
             }
-            self.queued.send_to(*peer, Message::AnnounceVotes(id));
+            let announcement = Message::AnnounceVotes(id);
+            self.tracker
+                .track_votes_announced(id, self.id, *peer, announcement.bytes_size());
+            self.queued.send_to(*peer, announcement);
         }
     }
 

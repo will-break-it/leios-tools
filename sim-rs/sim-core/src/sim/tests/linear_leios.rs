@@ -11,8 +11,8 @@ use tokio::sync::mpsc;
 use crate::{
     clock::{Clock, MockClockCoordinator, Timestamp},
     config::{
-        CommitteeSelectionAlgorithm, NodeId, RawLinkInfo, RawNode, RawTopology, SimConfiguration,
-        TransactionConfig,
+        CommitteeSelectionAlgorithm, LeiosVariant, NodeId, RawLinkInfo, RawNode, RawTopology,
+        RelayStrategy, SimConfiguration, TransactionConfig, VoteTransport,
     },
     events::{Event, EventTracker},
     model::{LinearEndorserBlock, LinearRankingBlock, Transaction, VoteBundle},
@@ -129,6 +129,7 @@ struct TestDriver {
     lottery: HashMap<NodeId, Arc<MockLotteryResults>>,
     queued: HashMap<NodeId, EventResult<LinearLeiosNode>>,
     events: BTreeMap<Timestamp, Vec<(NodeId, TimedEvent)>>,
+    tracked: mpsc::UnboundedReceiver<(Event, Timestamp)>,
 }
 
 impl TestDriver {
@@ -140,7 +141,7 @@ impl TestDriver {
         let rng = ChaChaRng::seed_from_u64(config.seed);
         let slot = 0;
         let time = MockClockCoordinator::new();
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (nodes, lottery) = new_sim(config.clone(), event_tx, time.clock());
         Self {
             config,
@@ -151,7 +152,48 @@ impl TestDriver {
             lottery,
             queued: HashMap::new(),
             events: BTreeMap::new(),
+            tracked: event_rx,
         }
+    }
+
+    /// Everything the nodes have reported to the event tracker since the
+    /// last call.  The run summary is built from these and from nothing
+    /// else, so this is where a test looks to see what a run would report.
+    pub fn drain_tracked_events(&mut self) -> Vec<Event> {
+        let mut events = vec![];
+        while let Ok((event, _)) = self.tracked.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// How many votes of its own `node` has queued but not yet signed.
+    /// Nothing is dequeued, so this can be asked repeatedly while time
+    /// advances.
+    pub fn queued_vote_generations(&self, node: NodeId) -> usize {
+        self.queued
+            .get(&node)
+            .map(|q| {
+                q.tasks
+                    .iter()
+                    .filter(|t| matches!(t, CpuTask::VTBundleGenerated(..)))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// How many vote-bundle verifications `node` has queued but not run.
+    /// One per arrival the node decided to pay for.
+    pub fn queued_vote_validations(&self, node: NodeId) -> usize {
+        self.queued
+            .get(&node)
+            .map(|q| {
+                q.tasks
+                    .iter()
+                    .filter(|t| matches!(t, CpuTask::VTBundleValidated(..)))
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     pub fn id_for(&self, name: &str) -> NodeId {
@@ -235,6 +277,26 @@ impl TestDriver {
                 self.process_events(node, events);
             }
         }
+    }
+
+    /// Drive `node` all the way to a vote bundle of its own: it mints an RB
+    /// with an EB, then votes for that EB off the head of its own chain.
+    /// Nothing is diffused on the way, so the only messages the caller has to
+    /// reason about afterwards are the ones the vote bundle itself produced.
+    pub fn produce_vote_bundle(&mut self, node: NodeId) -> Arc<VoteBundle> {
+        let _txs: [_; 3] = self.produce_txs(node, false);
+        // A node does not wait out the equivocation window for an EB it
+        // produced itself, so it draws its vote lottery as soon as the EB
+        // exists.  Both wins have to be queued before the slot turns over.
+        self.win_next_rb_lottery(node, 0);
+        self.win_next_vote_lottery(node, 0);
+        self.next_slot();
+        let (_rb, eb) = self.expect_cpu_task_matching(node, is_new_rb_task);
+        let eb = eb.expect("node did not produce EB");
+
+        let votes = self.expect_cpu_task_matching(node, is_new_vote_task);
+        assert_eq!(*votes.ebs.first_key_value().unwrap().0, eb.id());
+        votes
     }
 
     pub fn expect_tx_sent(&mut self, from: NodeId, to: NodeId, tx: Arc<Transaction>) {
@@ -384,6 +446,62 @@ fn is_new_rb_task(
         )),
         _ => None,
     }
+}
+
+/// The (sender, recipient) of every vote bundle reported as one the
+/// recipient did not need.
+fn duplicate_reports(events: &[Event]) -> Vec<(NodeId, NodeId)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::VTBundleDuplicate {
+                sender, recipient, ..
+            } => Some((sender.id, recipient.id)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every reported vote-protocol message, as
+/// (kind, sender, recipient, bytes).  Announcements and requests are the two
+/// that used to go uncounted, which is what made the arm that sends the most
+/// messages look like the one that sends the fewest.
+fn vote_wire_reports(events: &[Event]) -> Vec<(&'static str, NodeId, NodeId, u64)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::VTBundleSent {
+                sender,
+                recipient,
+                msg_size_bytes,
+                ..
+            } => Some(("body", sender.id, recipient.id, *msg_size_bytes)),
+            Event::VTBundleAnnounced {
+                sender,
+                recipient,
+                msg_size_bytes,
+                ..
+            } => Some(("announce", sender.id, recipient.id, *msg_size_bytes)),
+            Event::VTBundleRequested {
+                sender,
+                recipient,
+                msg_size_bytes,
+                ..
+            } => Some(("request", sender.id, recipient.id, *msg_size_bytes)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The (node, tally) of every reported quorum crossing.
+fn quorum_reports(events: &[Event]) -> Vec<(NodeId, u64)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::EBQuorumReached { node, votes, .. } => Some((node.id, *votes)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn is_new_vote_task(task: &CpuTask) -> Option<Arc<VoteBundle>> {
@@ -843,4 +961,1151 @@ fn sim_config_rejects_top_stake_fraction_when_sigma_c_le_tau() {
         msg.contains("σ_c") && msg.contains("τ"),
         "expected σ_c/τ violation, got: {msg}"
     );
+}
+
+/// CIP-0164 governs the committee by seat count.  `top-stake-seats`
+/// seats the top `committee-seat-count` pools by stake; each seat votes
+/// with weight 1 and the quorum denominator is the number of seats
+/// filled.
+///
+/// Topology: stakes 500/300/200 plus a zero-stake relay, 2 seats.
+/// pool-a and pool-b are seated; pool-c has stake but misses the cut,
+/// and the relay is not a pool at all.
+#[test]
+fn top_stake_seats_should_seat_only_the_top_pools() {
+    let topology = new_topology(vec![
+        (
+            "pool-a",
+            new_node(Some(500), vec!["pool-b", "pool-c", "relay"]),
+        ),
+        (
+            "pool-b",
+            new_node(Some(300), vec!["pool-a", "pool-c", "relay"]),
+        ),
+        (
+            "pool-c",
+            new_node(Some(200), vec!["pool-a", "pool-b", "relay"]),
+        ),
+        ("relay", new_node(None, vec!["pool-a", "pool-b", "pool-c"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.committee_selection_algorithm = CommitteeSelectionAlgorithm::TopStakeSeats;
+        params.committee_seat_count = 2;
+        params.quorum_weight_fraction = 0.75;
+    });
+
+    // One seat per seated pool, so the denominator is 2 — not the node
+    // count, and not the total stake.
+    assert_eq!(config.expected_total_weight, 2);
+    assert_eq!(config.vote_threshold(), 2);
+
+    let mut sim = TestDriver::new_with_config(config);
+    let pool_a = sim.id_for("pool-a");
+    let pool_b = sim.id_for("pool-b");
+    let pool_c = sim.id_for("pool-c");
+    let relay = sim.id_for("relay");
+
+    assert!(sim.config.vote_eligible_nodes.contains(&pool_a));
+    assert!(sim.config.vote_eligible_nodes.contains(&pool_b));
+    assert!(!sim.config.vote_eligible_nodes.contains(&pool_c));
+    assert!(!sim.config.vote_eligible_nodes.contains(&relay));
+
+    let txs: [_; 3] = sim.produce_txs(pool_a, false);
+    for tx in &txs {
+        for peer in [pool_b, pool_c, relay] {
+            sim.expect_tx_sent(pool_a, peer, tx.clone());
+        }
+    }
+
+    sim.win_next_rb_lottery(pool_a, 0);
+    sim.next_slot();
+    let (rb, eb) = sim.expect_cpu_task_matching(pool_a, is_new_rb_task);
+    let eb = eb.expect("node did not produce EB");
+
+    for peer in [pool_b, pool_c, relay] {
+        sim.expect_rb_and_eb_sent(pool_a, peer, rb.clone(), Some(eb.clone()));
+        sim.expect_eb_validated(peer, eb.clone());
+    }
+
+    sim.advance_time_to(sim.now() + (sim.config.header_diffusion_time * 3));
+
+    // A seat is worth exactly one vote, whatever the pool's stake.
+    let votes_a = sim.expect_cpu_task_matching(pool_a, is_new_vote_task);
+    assert_eq!(*votes_a.ebs.first_key_value().unwrap().0, eb.id());
+    assert_eq!(*votes_a.ebs.first_key_value().unwrap().1, 1);
+    let votes_b = sim.expect_cpu_task_matching(pool_b, is_new_vote_task);
+    assert_eq!(*votes_b.ebs.first_key_value().unwrap().1, 1);
+
+    // The unseated pool and the relay stay silent.
+    for (node, label) in [(pool_c, "pool-c"), (relay, "relay")] {
+        let has_vote_task = sim
+            .queued
+            .get(&node)
+            .map(|q| {
+                q.tasks
+                    .iter()
+                    .any(|t| matches!(t, CpuTask::VTBundleGenerated(..)))
+            })
+            .unwrap_or(false);
+        assert!(!has_vote_task, "{label} should not have generated a vote");
+    }
+}
+
+/// Ties are broken by pool identifier ascending, which is what the
+/// specification says.  Two pools of equal stake, one seat: the lower
+/// identifier takes it.  Node ids follow the topology's name order, so
+/// pool-a is id 0 and pool-b is id 1.
+#[test]
+fn top_stake_seats_breaks_ties_by_pool_id() {
+    let topology = new_topology(vec![
+        ("pool-a", new_node(Some(400), vec!["pool-b"])),
+        ("pool-b", new_node(Some(400), vec!["pool-a"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.committee_selection_algorithm = CommitteeSelectionAlgorithm::TopStakeSeats;
+        params.committee_seat_count = 1;
+        params.quorum_weight_fraction = 0.75;
+    });
+
+    assert_eq!(config.expected_total_weight, 1);
+
+    let sim = TestDriver::new_with_config(config);
+    let pool_a = sim.id_for("pool-a");
+    let pool_b = sim.id_for("pool-b");
+    assert!(pool_a < pool_b, "test assumes pool-a has the lower id");
+    assert!(sim.config.vote_eligible_nodes.contains(&pool_a));
+    assert!(!sim.config.vote_eligible_nodes.contains(&pool_b));
+}
+
+/// Fewer pools than seats is the expected case, not an error: the
+/// 1500-node pseudo-mainnet topology has 458 stake-holding nodes, so a
+/// 900-seat request seats 458.  Every pool is seated and the quorum
+/// denominator shrinks to the seats actually filled — keeping the
+/// denominator at the request would put quorum out of reach.
+#[test]
+fn top_stake_seats_seats_every_pool_when_short() {
+    let topology = new_topology(vec![
+        (
+            "pool-a",
+            new_node(Some(500), vec!["pool-b", "pool-c", "relay"]),
+        ),
+        (
+            "pool-b",
+            new_node(Some(300), vec!["pool-a", "pool-c", "relay"]),
+        ),
+        (
+            "pool-c",
+            new_node(Some(200), vec!["pool-a", "pool-b", "relay"]),
+        ),
+        ("relay", new_node(None, vec!["pool-a", "pool-b", "pool-c"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.committee_selection_algorithm = CommitteeSelectionAlgorithm::TopStakeSeats;
+        params.committee_seat_count = 900;
+        params.quorum_weight_fraction = 0.75;
+    });
+
+    // Three pools hold stake, so three of the 900 seats are filled.
+    assert_eq!(config.vote_eligible_nodes.len(), 3);
+    assert_eq!(config.expected_total_weight, 3);
+    // ceil(0.75 × 3) = 3, reachable.  Against the requested 900 the
+    // threshold would be 675 and no run could ever certify.
+    assert_eq!(config.vote_threshold(), 3);
+    assert!(config.vote_threshold() <= config.expected_total_weight);
+
+    let sim = TestDriver::new_with_config(config);
+    for name in ["pool-a", "pool-b", "pool-c"] {
+        assert!(
+            sim.config.vote_eligible_nodes.contains(&sim.id_for(name)),
+            "{name} should be seated"
+        );
+    }
+    // A zero-stake relay is not a pool and never takes a seat.
+    assert!(
+        !sim.config
+            .vote_eligible_nodes
+            .contains(&sim.id_for("relay"))
+    );
+}
+
+/// Zero seats would leave the quorum denominator at zero, which
+/// certifies an EB on no votes at all.  Reject it at config load.
+#[test]
+fn sim_config_rejects_top_stake_seats_with_zero_seats() {
+    let topology = new_topology(vec![
+        ("pool-a", new_node(Some(600), vec!["pool-b"])),
+        ("pool-b", new_node(Some(400), vec!["pool-a"])),
+    ]);
+    let mut params: crate::config::RawParameters =
+        serde_yaml::from_slice(include_bytes!("../../../../parameters/config.default.yaml"))
+            .unwrap();
+    params.leios_variant = crate::config::LeiosVariant::LinearWithTxReferences;
+    params.committee_selection_algorithm = CommitteeSelectionAlgorithm::TopStakeSeats;
+    params.committee_seat_count = 0;
+
+    let topology: crate::config::Topology = topology.into();
+    let err = SimConfiguration::build(params, topology).unwrap_err();
+    assert!(
+        err.to_string().contains("committee-seat-count"),
+        "expected a seat-count complaint, got: {err}"
+    );
+}
+
+/// A two-node topology and default parameters, ready for a build that is
+/// expected to succeed or fail on the committee mode alone.
+fn seat_count_params(
+    variant: LeiosVariant,
+) -> (crate::config::RawParameters, crate::config::Topology) {
+    let topology = new_topology(vec![
+        ("pool-a", new_node(Some(600), vec!["pool-b"])),
+        ("pool-b", new_node(Some(400), vec!["pool-a"])),
+    ]);
+    let mut params: crate::config::RawParameters =
+        serde_yaml::from_slice(include_bytes!("../../../../parameters/config.default.yaml"))
+            .unwrap();
+    params.leios_variant = variant;
+    params.committee_selection_algorithm = CommitteeSelectionAlgorithm::TopStakeSeats;
+    params.committee_seat_count = 2;
+    // One shard group, so `full-without-ibs` clears the unrelated sharding
+    // check that runs before the committee mode is looked at and the build
+    // fails, or succeeds, on the committee mode alone.
+    params.ib_shard_group_count = 1;
+    (params, topology.into())
+}
+
+/// `top-stake-seats` seats a committee and sets a seat-based quorum
+/// denominator, but only the linear node reads that seating when it decides
+/// whether, and with what weight, it votes.  Every other variant runs its own
+/// lottery and never looks at it, so the votes it casts are measured against
+/// a denominator nobody voted into and the certification figures mean
+/// nothing.  Rejecting only shared-consensus left four variants that built
+/// fine, ran, and reported those figures without a word.
+#[test]
+fn sim_config_rejects_top_stake_seats_for_variants_that_ignore_it() {
+    for variant in [
+        LeiosVariant::Short,
+        LeiosVariant::Full,
+        LeiosVariant::FullWithoutIbs,
+        LeiosVariant::FullWithTxReferences,
+        LeiosVariant::SharedConsensus,
+    ] {
+        let (params, topology) = seat_count_params(variant);
+        let err = SimConfiguration::build(params, topology).unwrap_err();
+        assert!(
+            err.to_string().contains("top-stake-seats"),
+            "{variant:?} ignores the seating, so pairing it with top-stake-seats \
+             has to be an error; got: {err}"
+        );
+    }
+}
+
+/// ...and the two that do honour it still build, so the guard rejects the
+/// pairing rather than the mode.
+#[test]
+fn sim_config_accepts_top_stake_seats_for_the_linear_variants() {
+    for variant in [LeiosVariant::Linear, LeiosVariant::LinearWithTxReferences] {
+        let (params, topology) = seat_count_params(variant);
+        let config = SimConfiguration::build(params, topology)
+            .unwrap_or_else(|e| panic!("{variant:?} honours the seating and must build: {e}"));
+        assert_eq!(config.expected_total_weight, 2, "{variant:?}");
+    }
+}
+
+/// `vote-diffusion-strategy` is the Haskell simulator's request-ordering key
+/// and is never read here; `vote-transport` is the one this simulator reads.
+/// The default config used to carry the transport's whole explanation above
+/// the former, and to promise that the former's values are accepted as
+/// aliases of `announce-then-request`.  They are not -- `VoteTransport`
+/// declares no aliases -- so a reader who followed that comment got a
+/// deserialization error.  Both halves of the claim are pinned here so the
+/// documentation cannot drift back onto the wrong key unnoticed.
+#[test]
+fn the_request_ordering_key_is_not_the_vote_transport() {
+    for value in ["peer-order", "freshest-first", "oldest-first"] {
+        assert!(
+            serde_yaml::from_str::<VoteTransport>(value).is_err(),
+            "{value} belongs to vote-diffusion-strategy; vote-transport has no such alias, \
+             and documenting one sends readers into a parse error"
+        );
+    }
+    for value in [
+        "announce-then-request",
+        "push",
+        "push-late-dedupe",
+        "push-no-dedupe",
+    ] {
+        serde_yaml::from_str::<VoteTransport>(value)
+            .unwrap_or_else(|e| panic!("{value} is a documented transport and must parse: {e}"));
+    }
+
+    // And the Haskell key has no say over the transport, whatever it is set to.
+    let mut config: serde_yaml::Value =
+        serde_yaml::from_slice(include_bytes!("../../../../parameters/config.default.yaml"))
+            .unwrap();
+    let key = serde_yaml::Value::from("vote-diffusion-strategy");
+    assert!(
+        config.get(&key).is_some(),
+        "the default config still ships the Haskell key this test is about"
+    );
+    config
+        .as_mapping_mut()
+        .unwrap()
+        .insert(key, serde_yaml::Value::from("oldest-first"));
+    let params: crate::config::RawParameters = serde_yaml::from_value(config).unwrap();
+    assert_eq!(
+        params.vote_transport,
+        VoteTransport::AnnounceThenRequest,
+        "moving the Haskell simulator's request-ordering key must not move this \
+         simulator's vote transport"
+    );
+}
+
+/// The default strategy sends the 8-byte id and waits to be asked for the
+/// body.  The body must never go out unsolicited, and the historic
+/// announce/request/deliver exchange must still deliver it.
+#[test]
+fn announce_then_request_should_not_push_vote_bundle() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2"])),
+        ("node-2", new_node(Some(1000), vec!["node-1"])),
+    ]);
+    let mut sim = TestDriver::new(topology);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    assert_eq!(
+        sim.config.vote_transport,
+        VoteTransport::AnnounceThenRequest,
+        "announce-then-request should be the default strategy"
+    );
+
+    let _ = sim.drain_tracked_events();
+    let votes = sim.produce_vote_bundle(node1);
+
+    // The body is not queued: node 2 has to ask for it first.
+    sim.expect_no_message(node1, node2, Message::Votes(votes.clone()));
+    sim.expect_vote_bundle_sent(node1, node2, votes.clone());
+
+    // Delivering one body over this transport costs three messages, not one.
+    // Only the body was ever counted, so the arm that spends the most
+    // messages was the one that appeared to spend the fewest.
+    assert_eq!(
+        vote_wire_reports(&sim.drain_tracked_events()),
+        vec![
+            ("announce", node1, node2, 8),
+            ("request", node2, node1, 8),
+            ("body", node1, node2, votes.bytes),
+        ]
+    );
+}
+
+/// The push arms send the body and nothing else, so their message count is
+/// their body count.  That is the comparison the announcement and request
+/// counters exist to make honest.
+#[test]
+fn push_should_send_no_control_messages() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2"])),
+        ("node-2", new_node(Some(1000), vec!["node-1"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.vote_transport = VoteTransport::Push;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+
+    let _ = sim.drain_tracked_events();
+    let votes = sim.produce_vote_bundle(node1);
+    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+
+    assert_eq!(
+        vote_wire_reports(&sim.drain_tracked_events()),
+        vec![("body", node1, node2, votes.bytes)]
+    );
+}
+
+/// Under `push` the body itself is the first thing a peer sees.  There is no
+/// announcement to answer and no request round-trip.
+#[test]
+fn push_should_send_vote_bundle_body_directly() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2"])),
+        ("node-2", new_node(Some(1000), vec!["node-1"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.vote_transport = VoteTransport::Push;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+
+    let votes = sim.produce_vote_bundle(node1);
+
+    sim.expect_no_message(node1, node2, Message::AnnounceVotes(votes.id));
+    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes));
+}
+
+/// A pushed bundle is forwarded once it validates, but never back down the
+/// link it arrived on.
+#[test]
+fn push_should_forward_vote_bundle_but_not_to_source() {
+    // A line, so node 2 has one consumer besides the peer it hears from.
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2"])),
+        ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
+        ("node-3", new_node(Some(1000), vec!["node-2"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.vote_transport = VoteTransport::Push;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    let node3 = sim.id_for("node-3");
+
+    let votes = sim.produce_vote_bundle(node1);
+
+    // Node 1 pushes to its only consumer, which validates the bundle.
+    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes.clone()));
+
+    // Node 2 passes it on to node 3, and does not echo it back to node 1.
+    sim.expect_no_message(node2, node1, Message::Votes(votes.clone()));
+    sim.expect_message(node2, node3, Message::Votes(votes));
+}
+
+/// The Haskell node's notify server has no per-peer provenance, so it sends
+/// a bundle straight back to the peer it came from.  Setting
+/// `vote-diffusion-echo-to-source` reproduces that waste so it can be
+/// measured.
+#[test]
+fn push_should_echo_vote_bundle_to_source_when_configured() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2"])),
+        ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
+        ("node-3", new_node(Some(1000), vec!["node-2"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.vote_transport = VoteTransport::Push;
+        params.vote_transport_echo_to_source = true;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    let node3 = sim.id_for("node-3");
+
+    let votes = sim.produce_vote_bundle(node1);
+
+    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes.clone()));
+
+    // Every consumer gets the body, the source peer included.  Node 1 already
+    // holds the bundle, so its copy is dropped on arrival.
+    sim.expect_message(node2, node3, Message::Votes(votes.clone()));
+    sim.expect_message(node2, node1, Message::Votes(votes));
+}
+
+/// The echo models the Haskell node's notify server, which pushes bodies and
+/// has no per-peer provenance to exclude the sender with.
+/// `announce-then-request` has no such server: it would re-announce to the
+/// peer that just handed it the body, buying a request and a second copy of
+/// a bundle it is already holding.  That is not the gap the flag exists to
+/// measure, and `announce-then-request` is the published baseline, so the
+/// flag leaves it exactly as it was.
+#[test]
+fn announce_then_request_should_ignore_the_echo_flag() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2"])),
+        ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
+        ("node-3", new_node(Some(1000), vec!["node-2"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.vote_transport_echo_to_source = true;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    let node3 = sim.id_for("node-3");
+    assert_eq!(
+        sim.config.vote_transport,
+        VoteTransport::AnnounceThenRequest,
+        "the flag is set on the baseline transport, which is what it must not change"
+    );
+
+    let _ = sim.drain_tracked_events();
+    let votes = sim.produce_vote_bundle(node1);
+    sim.expect_vote_bundle_sent(node1, node2, votes.clone());
+
+    // Node 2 announces onwards to node 3 and says nothing back to node 1.
+    sim.expect_no_message(node2, node1, Message::AnnounceVotes(votes.id));
+    sim.expect_no_message(node2, node1, Message::Votes(votes.clone()));
+    assert_eq!(
+        vote_wire_reports(&sim.drain_tracked_events()),
+        vec![
+            ("announce", node1, node2, 8),
+            ("request", node2, node1, 8),
+            ("body", node1, node2, votes.bytes),
+            ("announce", node2, node3, 8),
+        ],
+        "one announcement onwards and nothing back down the link it came from"
+    );
+}
+
+/// A second copy of a bundle a node already holds costs only the bytes: it is
+/// not validated again and it is not forwarded again.
+#[test]
+fn push_should_drop_duplicate_vote_bundle() {
+    // A triangle, so the bundle reaches node 2 twice: once from its producer
+    // and once by way of node 3.
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2", "node-3"])),
+        ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
+        ("node-3", new_node(Some(1000), vec!["node-1", "node-2"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.vote_transport = VoteTransport::Push;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    let node3 = sim.id_for("node-3");
+
+    let votes = sim.produce_vote_bundle(node1);
+
+    // Node 1 pushes to both peers, and each forwards to the other.
+    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes.clone()));
+    sim.expect_message(node1, node3, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node3, CpuTask::VTBundleValidated(node1, votes.clone()));
+
+    // Drain node 2's forward so anything queued to node 3 afterwards is new.
+    sim.expect_message(node2, node3, Message::Votes(votes.clone()));
+
+    // Node 3's copy now lands on node 2, which already holds the bundle.
+    let _ = sim.drain_tracked_events();
+    sim.expect_message(node3, node2, Message::Votes(votes.clone()));
+
+    let events = sim.drain_tracked_events();
+    assert_eq!(
+        duplicate_reports(&events),
+        vec![(node3, node2)],
+        "dropping a duplicate has to be reported, or the arm looks cheaper than it is"
+    );
+    assert_eq!(
+        sim.queued_vote_validations(node2),
+        0,
+        "duplicate vote bundle should not be validated a second time"
+    );
+    sim.expect_no_message(node2, node1, Message::Votes(votes.clone()));
+    sim.expect_no_message(node2, node3, Message::Votes(votes));
+}
+
+/// `push-no-dedupe` is the deliberate worst case: it pays for a bundle it
+/// already holds and sends it on again.  Only that single step is asserted;
+/// the strategy is a broadcast storm and does not settle if run out.
+#[test]
+fn push_no_dedupe_should_revalidate_duplicate_vote_bundle() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2", "node-3"])),
+        ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
+        ("node-3", new_node(Some(1000), vec!["node-1", "node-2"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.vote_transport = VoteTransport::PushNoDedupe;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    let node3 = sim.id_for("node-3");
+
+    let votes = sim.produce_vote_bundle(node1);
+
+    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes.clone()));
+    sim.expect_message(node1, node3, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node3, CpuTask::VTBundleValidated(node1, votes.clone()));
+
+    // Node 3's copy is a duplicate for node 2, and node 2 validates it anyway.
+    let _ = sim.drain_tracked_events();
+    sim.expect_message(node3, node2, Message::Votes(votes.clone()));
+    let on_arrival = duplicate_reports(&sim.drain_tracked_events());
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node3, votes.clone()));
+    let after_validating = duplicate_reports(&sim.drain_tracked_events());
+
+    // Reported once, and reported where the arm actually pays for it: this
+    // is the one strategy that forwards a duplicate rather than dropping it,
+    // so it goes on to verify the copy and is charged for it at the far end.
+    // Reporting the same arrival on the way in as well drove duplicates past
+    // arrivals, which is how the summary came to print a duplicate share
+    // above 100% and an "inf" verification rate.
+    assert_eq!(
+        [on_arrival, after_validating].concat(),
+        vec![(node3, node2)],
+        "the arm that suppresses nothing is the one whose duplicates most need reporting, \
+         and it needs them reported once"
+    );
+
+    // Having revalidated it, node 2 sends it on to every consumer but node 3.
+    // Following that hop is the point: node 1 already holds the bundle, so
+    // its copy is the run's second duplicate, and stopping the test here left
+    // the one-report-per-arrival property asserted on a single arrival.  It
+    // is on the second, where a bundle that keeps being forwarded keeps being
+    // reported, that a double report compounds.
+    let _ = sim.drain_tracked_events();
+    sim.expect_message(node2, node1, Message::Votes(votes.clone()));
+    assert!(
+        duplicate_reports(&sim.drain_tracked_events()).is_empty(),
+        "this arm verifies before it calls a copy redundant, so nothing is \
+         reported on the way in"
+    );
+    assert_eq!(
+        sim.queued_vote_validations(node1),
+        1,
+        "the copy is queued for a verification node 1 does not need, which is \
+         the cost this arm exists to show"
+    );
+
+    sim.expect_cpu_task(node1, CpuTask::VTBundleValidated(node2, votes.clone()));
+    assert_eq!(
+        duplicate_reports(&sim.drain_tracked_events()),
+        vec![(node2, node1)],
+        "one report for this arrival too, at the far end, where the wasted \
+         verification was paid for"
+    );
+
+    // And on it goes: node 1 forwards a bundle it has now verified twice.
+    // This is the storm, and the reason the arm is never run out.
+    sim.expect_message(node1, node3, Message::Votes(votes));
+}
+
+/// `push-late-dedupe` marks a bundle only once it is fully held, so a copy
+/// that arrives while the first one is still being verified is verified too.
+/// That second signature check is the whole difference between this arm and
+/// `push`: identical delivery, identical bytes, more CPU.  It has to show up
+/// as a duplicate, and it must not be forwarded a second time.
+#[test]
+fn push_late_dedupe_should_verify_a_duplicate_that_arrives_while_validating() {
+    // A triangle, so the bundle reaches node 2 twice: once from its producer
+    // and once by way of node 3.
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2", "node-3"])),
+        ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
+        ("node-3", new_node(Some(1000), vec!["node-1", "node-2"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.vote_transport = VoteTransport::PushLateDedupe;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    let node3 = sim.id_for("node-3");
+
+    let votes = sim.produce_vote_bundle(node1);
+
+    // Node 1 pushes to both peers.  Node 2's copy is left in flight: its
+    // verification is queued and deliberately not run yet.
+    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+    sim.expect_message(node1, node3, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node3, CpuTask::VTBundleValidated(node1, votes.clone()));
+
+    // Node 3 forwards its copy to node 2, which is still validating the first.
+    let _ = sim.drain_tracked_events();
+    sim.expect_message(node3, node2, Message::Votes(votes.clone()));
+    assert_eq!(
+        sim.queued_vote_validations(node2),
+        2,
+        "late dedupe pays for a copy that arrives inside the validation window"
+    );
+    assert!(
+        duplicate_reports(&sim.drain_tracked_events()).is_empty(),
+        "nothing is known to be redundant yet: the arrival is on its way to being verified"
+    );
+
+    // The first copy is accepted and passed on.
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes.clone()));
+    sim.expect_message(node2, node3, Message::Votes(votes.clone()));
+
+    // The second was verified for nothing.  It is reported once it is known
+    // to be redundant, and it is not forwarded again.
+    let _ = sim.drain_tracked_events();
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node3, votes.clone()));
+    assert_eq!(
+        duplicate_reports(&sim.drain_tracked_events()),
+        vec![(node3, node2)],
+        "a verification spent on a bundle we already had is the cost this arm exists to measure"
+    );
+    sim.expect_no_message(node2, node1, Message::Votes(votes));
+}
+
+/// Once a `push-late-dedupe` node fully holds a bundle it behaves like
+/// `push`: a further copy costs the bytes and nothing else.
+#[test]
+fn push_late_dedupe_should_drop_a_duplicate_it_already_holds() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2", "node-3"])),
+        ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
+        ("node-3", new_node(Some(1000), vec!["node-1", "node-2"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.vote_transport = VoteTransport::PushLateDedupe;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    let node3 = sim.id_for("node-3");
+
+    let votes = sim.produce_vote_bundle(node1);
+
+    // Both peers take the bundle all the way, so each fully holds it.
+    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes.clone()));
+    sim.expect_message(node1, node3, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node3, CpuTask::VTBundleValidated(node1, votes.clone()));
+
+    // Node 3's forward lands on a node that is done with this bundle.
+    let _ = sim.drain_tracked_events();
+    sim.expect_message(node3, node2, Message::Votes(votes.clone()));
+    assert_eq!(
+        duplicate_reports(&sim.drain_tracked_events()),
+        vec![(node3, node2)]
+    );
+    assert_eq!(
+        sim.queued_vote_validations(node2),
+        0,
+        "a bundle we already hold is recognised before it costs a signature check"
+    );
+}
+
+/// Under `relay-strategy: request-from-all` a node asks every peer that
+/// announces a bundle, so the announce-then-request path is handed several
+/// bodies, verifies each of them and keeps one.  The copies it did not need
+/// are as real as any pushed duplicate and are reported the same way.
+#[test]
+fn request_from_all_should_report_the_body_it_verified_and_did_not_need() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2", "node-3"])),
+        ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
+        ("node-3", new_node(Some(1000), vec!["node-1", "node-2"])),
+    ]);
+    let config = new_sim_config_with(topology, |params| {
+        params.relay_strategy = RelayStrategy::RequestFromAll;
+    });
+    assert_eq!(
+        config.vote_transport,
+        VoteTransport::AnnounceThenRequest,
+        "this is the announce path, not a push arm"
+    );
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    let node3 = sim.id_for("node-3");
+
+    let votes = sim.produce_vote_bundle(node1);
+
+    // Node 2 goes first, so that it holds the body and can serve it on.
+    sim.expect_message(node1, node2, Message::AnnounceVotes(votes.id));
+    sim.expect_message(node2, node1, Message::RequestVotes(votes.id));
+    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes.clone()));
+
+    // Node 3 hears about the bundle from both peers before either answers,
+    // and asks both.
+    sim.expect_message(node1, node3, Message::AnnounceVotes(votes.id));
+    sim.expect_message(node2, node3, Message::AnnounceVotes(votes.id));
+    sim.expect_message(node3, node1, Message::RequestVotes(votes.id));
+    sim.expect_message(node3, node2, Message::RequestVotes(votes.id));
+
+    // Two bodies arrive, and both are verified.
+    let _ = sim.drain_tracked_events();
+    sim.expect_message(node1, node3, Message::Votes(votes.clone()));
+    sim.expect_message(node2, node3, Message::Votes(votes.clone()));
+    assert_eq!(
+        sim.queued_vote_validations(node3),
+        2,
+        "each answer to a request is verified on arrival"
+    );
+    assert!(
+        duplicate_reports(&sim.drain_tracked_events()).is_empty(),
+        "an arrival is only redundant once something else has been accepted"
+    );
+
+    sim.expect_cpu_task(node3, CpuTask::VTBundleValidated(node1, votes.clone()));
+    let _ = sim.drain_tracked_events();
+    sim.expect_cpu_task(node3, CpuTask::VTBundleValidated(node2, votes.clone()));
+    assert_eq!(
+        duplicate_reports(&sim.drain_tracked_events()),
+        vec![(node2, node3)],
+        "the announce path does deliver a body twice under request-from-all"
+    );
+}
+
+/// A node reports the moment its own tally of votes for an EB crosses the
+/// quorum threshold, once, so the summary can measure how long a quorum
+/// takes to form.  The test config takes two votes to certify.
+#[test]
+fn quorum_should_be_reported_when_the_tally_crosses_the_threshold() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2"])),
+        ("node-2", new_node(Some(1000), vec!["node-1"])),
+    ]);
+    let mut sim = TestDriver::new(topology);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    assert_eq!(sim.config.vote_threshold(), 2);
+
+    let txs: [_; 3] = sim.produce_txs(node1, false);
+    for tx in &txs {
+        sim.expect_tx_sent(node1, node2, tx.clone());
+    }
+
+    sim.win_next_vote_lottery(node1, 0);
+    sim.win_next_vote_lottery(node2, 0);
+    sim.win_next_rb_lottery(node1, 0);
+    sim.next_slot();
+    let (rb, eb) = sim.expect_cpu_task_matching(node1, is_new_rb_task);
+    let eb = eb.expect("node did not produce EB");
+    sim.expect_rb_and_eb_sent(node1, node2, rb, Some(eb.clone()));
+    sim.expect_eb_validated(node2, eb.clone());
+    sim.advance_time_to(sim.now() + (sim.config.header_diffusion_time * 3));
+
+    // One vote each.  Neither node has a quorum from its own vote alone.
+    let _ = sim.drain_tracked_events();
+    let votes_1 = sim.expect_cpu_task_matching(node1, is_new_vote_task);
+    let votes_2 = sim.expect_cpu_task_matching(node2, is_new_vote_task);
+    assert!(
+        quorum_reports(&sim.drain_tracked_events()).is_empty(),
+        "one vote out of the two it takes is not a quorum"
+    );
+
+    // Node 1 counts node 2's vote on top of its own and has a quorum.
+    sim.expect_vote_bundle_sent(node2, node1, votes_2);
+    assert_eq!(
+        quorum_reports(&sim.drain_tracked_events()),
+        vec![(node1, 2)],
+        "the second vote is the one that crosses the threshold"
+    );
+
+    // Node 2 gets there too, and neither reports a crossing twice.
+    sim.expect_vote_bundle_sent(node1, node2, votes_1);
+    assert_eq!(
+        quorum_reports(&sim.drain_tracked_events()),
+        vec![(node2, 2)]
+    );
+}
+
+/// Once per node per EB has to survive pruning.
+///
+/// A node prunes an EB's tally once that EB is endorsed on-chain, and the
+/// record that its quorum was already reported goes with it.  A vote bundle
+/// that finishes validating after the prune would rebuild the tally from
+/// zero and cross the threshold a second time, putting the same node into
+/// the summary's sample twice -- and the sample is stake-weighted, so its
+/// stake is counted twice in the median and the 95th percentile the study
+/// reports.  The pruned-EB tombstone is what stops it.
+#[test]
+fn a_late_vote_for_a_pruned_eb_does_not_report_a_second_quorum() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2", "node-3"])),
+        ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
+        ("node-3", new_node(Some(1000), vec!["node-1", "node-2"])),
+    ]);
+    // One vote certifies, so a single late bundle is enough to re-cross the
+    // threshold on a tally that has been reset to zero.
+    let config = new_sim_config_with(topology, |params| {
+        params.quorum_weight_fraction = 0.5;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    let node3 = sim.id_for("node-3");
+    assert_eq!(sim.config.vote_threshold(), 1);
+
+    let txs: [_; 3] = sim.produce_txs(node1, false);
+    for tx in &txs {
+        sim.expect_tx_sent(node1, node2, tx.clone());
+        sim.expect_tx_sent(node1, node3, tx.clone());
+    }
+
+    // Node 1 mints the EB and votes for it without waiting out the gate, the
+    // way a producer does for its own block.
+    sim.win_next_rb_lottery(node1, 0);
+    sim.win_next_vote_lottery(node1, 0);
+    sim.next_slot();
+    let (rb, eb) = sim.expect_cpu_task_matching(node1, is_new_rb_task);
+    let eb = eb.expect("node did not produce EB");
+    let votes_1 = sim.expect_cpu_task_matching(node1, is_new_vote_task);
+
+    sim.expect_rb_and_eb_sent(node1, node2, rb.clone(), Some(eb.clone()));
+    sim.expect_eb_validated(node2, eb.clone());
+    // Node 3 will vote at the gate, so its lottery is armed before it can
+    // draw.
+    sim.win_next_vote_lottery(node3, 0);
+    sim.expect_rb_and_eb_sent(node1, node3, rb, Some(eb.clone()));
+    sim.expect_eb_validated(node3, eb.clone());
+
+    // Node 1's vote is all it takes: node 2 has a quorum, and says so once.
+    let _ = sim.drain_tracked_events();
+    sim.expect_vote_bundle_sent(node1, node2, votes_1);
+    assert_eq!(
+        quorum_reports(&sim.drain_tracked_events()),
+        vec![(node2, 1)],
+        "one vote is the threshold here, so the first one crosses it"
+    );
+
+    // Node 3 votes at the gate.  Its bundle is announced to node 2 and left
+    // sitting there: it is the late arrival this test is about.
+    sim.advance_time_to(sim.config.voting_window().gate_at(eb.slot));
+    let votes_3 = sim.expect_cpu_task_matching(node3, is_new_vote_task);
+    assert_eq!(*votes_3.ebs.first_key_value().unwrap().0, eb.id());
+
+    // Node 2 certifies the EB in a ranking block of its own, which is what
+    // makes the EB old news and prunes its tally.
+    sim.advance_time_to(sim.config.voting_window().inclusion_deadline_at(eb.slot));
+    sim.win_next_rb_lottery(node2, 0);
+    sim.next_slot();
+    let (rb_2, _) = sim.expect_cpu_task_matching(node2, is_new_rb_task);
+    assert_eq!(
+        rb_2.endorsement.as_ref().map(|e| e.eb),
+        Some(eb.id()),
+        "the prune only happens once the EB is endorsed on-chain, so a block \
+         without the endorsement would leave this test asserting nothing"
+    );
+
+    // Node 3's bundle turns up after all that.  It is the first copy node 2
+    // has seen, so it is verified and counted -- and counted into an EB whose
+    // tally, and whose already-reported quorum, have both been erased.
+    let _ = sim.drain_tracked_events();
+    sim.expect_vote_bundle_sent(node3, node2, votes_3);
+    assert!(
+        quorum_reports(&sim.drain_tracked_events()).is_empty(),
+        "node 2 already reported this EB's quorum; reporting it again puts one \
+         node in the stake-weighted sample twice"
+    );
+}
+
+#[test]
+fn voting_window_is_anchored_on_the_announcing_slot() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2"])),
+        ("node-2", new_node(Some(1000), vec!["node-1"])),
+    ]);
+    let config = new_sim_config(topology);
+    let window = config.voting_window();
+    // CIP-0164 states every one of these as an offset from the slot of
+    // the ranking block that announced the EB, and nothing is measured
+    // from the EB being generated -- the EB has no slot of its own.
+    assert_eq!(window.header_deadline, config.header_diffusion_time);
+    assert_eq!(window.gate, config.header_diffusion_time * 3);
+    assert_eq!(
+        window.deadline,
+        window.gate + Duration::from_secs(config.linear_vote_stage_length)
+    );
+    assert_eq!(
+        window.inclusion_deadline,
+        window.deadline + Duration::from_secs(config.linear_diffuse_stage_length)
+    );
+    let t0 = Timestamp::from_secs(70);
+    assert_eq!(window.header_deadline_at(70), t0 + window.header_deadline);
+    assert_eq!(window.gate_at(70), t0 + window.gate);
+    assert_eq!(window.deadline_at(70), t0 + window.deadline);
+    assert_eq!(
+        window.inclusion_deadline_at(70),
+        t0 + window.inclusion_deadline
+    );
+}
+
+#[test]
+fn no_vote_is_cast_before_the_gate() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2"])),
+        ("node-2", new_node(Some(1000), vec!["node-1"])),
+    ]);
+    let mut sim = TestDriver::new(topology);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+
+    let txs: [_; 3] = sim.produce_txs(node1, false);
+    for tx in &txs {
+        sim.expect_tx_sent(node1, node2, tx.clone());
+    }
+
+    sim.win_next_rb_lottery(node1, 0);
+    sim.next_slot();
+    let (rb, eb) = sim.expect_cpu_task_matching(node1, is_new_rb_task);
+    let eb = eb.expect("node did not produce EB");
+    sim.expect_rb_and_eb_sent(node1, node2, rb, Some(eb.clone()));
+    // The lottery has to be armed before the EB validates, not after.  A node
+    // draws the moment it decides it may vote, so with the gate deleted
+    // altogether node 2 would draw on validation -- and lose, on an empty
+    // queue -- and every assertion below would still pass.  Arming it first
+    // means the only thing standing between node 2 and a vote is the gate,
+    // which is what this test is for.
+    sim.win_next_vote_lottery(node2, 0);
+    sim.expect_eb_validated(node2, eb.clone());
+    assert_eq!(
+        sim.queued_vote_generations(node2),
+        0,
+        "validating the EB must not itself produce a vote: the gate has not passed"
+    );
+
+    // The EB is validated and the lottery is won, so the only thing left
+    // between node 2 and a vote is the equivocation-detection period.
+    let gate = sim.config.voting_window().gate_at(eb.slot);
+    sim.advance_time_to(gate - Duration::from_millis(1));
+    assert_eq!(
+        sim.queued_vote_generations(node2),
+        0,
+        "a vote a millisecond before t0 + 3 * L_hdr would be one no honest node may cast"
+    );
+    sim.advance_time_to(gate);
+    assert_eq!(
+        sim.queued_vote_generations(node2),
+        1,
+        "and the gate is exactly when it may"
+    );
+}
+
+/// A star, so the centre has `spokes` consumers to choose between.
+fn new_star_topology(spokes: usize) -> RawTopology {
+    let mut nodes = vec![("node-1", new_node(Some(1000), vec![]))];
+    for name in SPOKE_NAMES.iter().take(spokes) {
+        nodes.push((*name, new_node(Some(1000), vec!["node-1"])));
+    }
+    new_topology(nodes)
+}
+
+const SPOKE_NAMES: [&str; 6] = ["node-2", "node-3", "node-4", "node-5", "node-6", "node-7"];
+
+/// Who did `from` push a vote body to, without consuming the messages?
+fn vote_push_targets(sim: &TestDriver, from: NodeId) -> std::collections::BTreeSet<NodeId> {
+    sim.queued
+        .get(&from)
+        .map(|q| {
+            q.messages
+                .iter()
+                .filter(|(_, m)| matches!(m, Message::Votes(_)))
+                .map(|(to, _)| *to)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Bounded fanout pushes to `vote-push-fanout` peers, not to every consumer.
+/// This is the whole point of the arm: the duplicate flood is proportional
+/// to the fanout, so capping it is what removes the redundant verifications.
+#[test]
+fn bounded_fanout_pushes_to_exactly_the_configured_number_of_peers() {
+    let config = new_sim_config_with(new_star_topology(4), |params| {
+        params.vote_transport = VoteTransport::Push;
+        params.vote_push_fanout = Some(2);
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+
+    sim.produce_vote_bundle(node1);
+
+    let targets = vote_push_targets(&sim, node1);
+    assert_eq!(
+        targets.len(),
+        2,
+        "expected the body on exactly 2 of 4 links, got {targets:?}"
+    );
+}
+
+/// Asking for more peers than exist is not an error and not a truncation:
+/// every consumer gets the body, exactly as with no limit at all.
+#[test]
+fn fanout_larger_than_the_peer_count_pushes_to_every_consumer() {
+    let config = new_sim_config_with(new_star_topology(4), |params| {
+        params.vote_transport = VoteTransport::Push;
+        params.vote_push_fanout = Some(10);
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+
+    sim.produce_vote_bundle(node1);
+
+    assert_eq!(vote_push_targets(&sim, node1).len(), 4);
+}
+
+/// The subset is a pure function of the seed, so two runs of the same
+/// configuration choose the same peers.  Without this the arm could not be
+/// compared against any other, because each run would diffuse differently.
+#[test]
+fn bounded_fanout_chooses_the_same_peers_on_every_run() {
+    let choose = || {
+        let config = new_sim_config_with(new_star_topology(4), |params| {
+            params.vote_transport = VoteTransport::Push;
+            params.vote_push_fanout = Some(2);
+        });
+        let mut sim = TestDriver::new_with_config(config);
+        let node1 = sim.id_for("node-1");
+        sim.produce_vote_bundle(node1);
+        vote_push_targets(&sim, node1)
+    };
+    assert_eq!(choose(), choose());
+}
+
+/// Turning the limit off restores the unbounded behaviour byte for byte,
+/// so the default arm is unaffected by this parameter existing.
+#[test]
+fn no_fanout_limit_pushes_to_every_consumer() {
+    let config = new_sim_config_with(new_star_topology(4), |params| {
+        params.vote_transport = VoteTransport::Push;
+        params.vote_push_fanout = None;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+
+    sim.produce_vote_bundle(node1);
+
+    assert_eq!(vote_push_targets(&sim, node1).len(), 4);
+}
+
+/// A limit that cannot take effect is rejected rather than ignored: a run
+/// that quietly used the default would still print numbers, and nothing in
+/// the output would say the limit was dropped.
+#[test]
+fn sim_config_rejects_a_fanout_limit_that_could_not_apply() {
+    // (name, transport, fanout, variant, expected error fragment)
+    let cases = [
+        (
+            "zero",
+            VoteTransport::Push,
+            0u64,
+            crate::config::LeiosVariant::LinearWithTxReferences,
+            "vote-push-fanout is 0",
+        ),
+        (
+            "not a push transport",
+            VoteTransport::AnnounceThenRequest,
+            2,
+            crate::config::LeiosVariant::LinearWithTxReferences,
+            "would have no effect",
+        ),
+        (
+            "not a linear variant",
+            VoteTransport::Push,
+            2,
+            crate::config::LeiosVariant::Short,
+            "linear Leios variants only",
+        ),
+    ];
+    for (name, transport, fanout, variant, expected) in cases {
+        let mut params: crate::config::RawParameters =
+            serde_yaml::from_slice(include_bytes!("../../../../parameters/config.default.yaml"))
+                .unwrap();
+        params.leios_variant = variant;
+        params.vote_transport = transport;
+        params.vote_push_fanout = Some(fanout);
+        let err = SimConfiguration::build(params, new_star_topology(4).into()).expect_err(
+            &format!("{name}: a fanout limit that cannot apply must be rejected"),
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(expected),
+            "{name}: expected an error mentioning {expected:?}, got {msg:?}"
+        );
+    }
 }
