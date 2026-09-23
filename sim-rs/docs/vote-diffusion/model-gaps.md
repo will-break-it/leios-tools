@@ -6,7 +6,10 @@ a reader can tell which conclusions survive it.
 
 ## 1. No adversary, anywhere
 
-No arm includes a node that withholds, delays, equivocates or floods.
+No arm includes a node that withholds, delays, equivocates or floods, and none
+is planned: extending the simulator to model one is more work than this study
+justifies. This section therefore records a standing limitation, not a backlog
+item.
 
 The gap bites hardest on `pull-offer-all`, because its request rule has no
 recovery path. In [`receive_announce_votes`](../../sim-core/src/sim/linear_leios.rs),
@@ -33,12 +36,16 @@ Failing to diffuse votes costs liveness (lost throughput), not safety: a node
 holding a valid certificate can still include it. That is why this gap was
 accepted for the first pass, not why it is closed.
 
-## 2. Bounded push has no repair mechanism
+## 2. Bounded fanout has no repair mechanism, and loses certification
 
 `push-cap-N` picks recipients by `hash(seed, node, bundle, peer)`. Each vote
 takes its own subgraph, and **delivery to any particular node is not guaranteed**.
-Nothing detects or repairs a node the selection skipped. This is exactly why the
-unprotected caps reached quorum on 0 of 26 EBs, and why BP protection was needed.
+Nothing detects or repairs a node the selection skipped. Across VD-1's 72 capped
+runs this was not a partial loss: cap 8 produced **zero L1 endorsements in every
+run**, and caps 16 and 8 never reached Q50. The same objection applies to capping
+announcement fanout — no offer means no request — so a bounded-coverage rule is
+ruled out on either message class, and the bandwidth lever belongs on the
+serving side instead.
 
 Protection is a topology marking, not a protocol mechanism: the study runner sets
 `always-forward-votes: true` on each BP's upstream links. A real deployment would

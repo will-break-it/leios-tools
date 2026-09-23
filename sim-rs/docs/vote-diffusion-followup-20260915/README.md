@@ -51,7 +51,9 @@ Bounded push is flat — every relay forwards exactly eight copies, so its media
 
 **Pull replaces copies with smaller copies; it does not remove them.** Pull sends 348,055,165 announcements where unrestricted push sends 347,703,105 bodies. The flood is the same shape. A vote body is 94 bytes, so pull's entire saving is the size ratio of an announcement to a body, and it decays as announcements grow: 11.8x per copy at 8 bytes, 1.5x at 64. Bodies are 30% of pull's traffic at 8/8 and 5% at 64/64.
 
-This locates the lever for a rate-limited hybrid: **cap the announcement fanout, not the body fanout**. Applying this matrix's cap-8 copy ratio (21.7% of consumers) to the announcement flood estimates roughly 1.97 GB at 8/8 — under both pull and protected cap 8. That is an extrapolation from these runs, not a simulated arm; VD-5 in the [experiment register](../vote-diffusion/README.md) is where it gets measured.
+An earlier revision of this report read that as a case for capping the announcement fanout. **That is withdrawn.** A node that receives no offer sends no request, so capping offers breaks coverage exactly as capping bodies does — and the [108-run study](../vote-diffusion-results-20260910/README.md) shows what that costs: across its 72 capped runs, cap 8 produced zero L1 endorsements and caps 16 and 8 never reached Q50. Offers have to reach everyone.
+
+The bandwidth levers that keep coverage are aggregating offers so one message carries several identifiers, and rate-limiting the **serving** side rather than the offering side, which is the shape EB fetch already uses. Bodies already move along a near-spanning tree with zero redundant arrivals, so there is nothing to save there. VD-5 in the [experiment register](../vote-diffusion/README.md) is where the serving limit gets measured.
 
 No obsolete verifications were measured in these ten runs. The original CPU-stress cases have not been rerun with that instrumentation, so this does not quantify their obsolete work.
 
