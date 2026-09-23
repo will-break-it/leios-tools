@@ -14,7 +14,7 @@ do and do not support.
 |---|---|---|---|
 | **VD-1** transport baseline | Does vote streaming stay feasible at 750/1500 nodes, and how do push and pull compare? | done, 108 runs, seeds 0–2 | [results 2026-09-10](../vote-diffusion-results-20260910/README.md) |
 | **VD-2** BP protection and control size | Does bounded push need to protect BP links, and how much does pull depend on the announcement size? | done, 10 runs, seed 0 | [follow-up 2026-09-15](../vote-diffusion-followup-20260915/README.md) |
-| **VD-3** BP upstream count | Do three upstream relays per BP change the answer? Two is the current fixture; SPO practice is two public plus one unlisted. | not started | — |
+| **VD-3** BP upstream count | Do three upstream relays per BP change the answer? Two is the current fixture; SPO practice is two public plus one unlisted. | tooling ready, not run | [how to run](../vote-diffusion-study.md#block-producer-upstream-count) |
 | **VD-4** committee scale | What burst does a network with ~1000 block producers produce? | not started | — |
 | **VD-5** offer cap | Does capping *announcement* fanout give pull's byte count with bounded push's peak? | not started | — |
 | **VD-6** seed replication | Does the VD-2 BP-protection result hold across seeds? | not started | — |

@@ -153,6 +153,7 @@ for byte from their bundled evidence.
 ```sh
 cargo test --workspace --locked --offline
 python3 scripts/test-vote-diffusion-study.py
+python3 scripts/test-add-bp-upstreams.py
 python3 scripts/test-summarize-vote-traffic.py
 python3 scripts/test-vote-traffic-cli.py --binary target/release/sim-cli
 ```
@@ -215,6 +216,8 @@ Defaults:
 | `VOTE_STUDY_REQUEST_BYTES` | `8` |
 | `VOTE_STUDY_NODE_TRAFFIC` | `0` (set `1` to save per-node vote traffic) |
 | `VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS` | `false` |
+| `VOTE_STUDY_BP_UPSTREAMS` | `2` (the fixture's own degree) |
+| `VOTE_STUDY_BP_UPSTREAM_LATENCY` | `sampled` (or `copy`) |
 | `VOTE_STUDY_SLOTS` | `400` |
 | `VOTE_STUDY_DRY_RUN` | `0` |
 | `VOTE_STUDY_CONFIG_REVISION` | Detected from base config, or explicitly unknown |
@@ -227,7 +230,7 @@ protected BP connections take places within the same total cap: one protected
 BP at fanout 22 leaves 21 places for other consumers. Source exclusion still
 applies. A node with more protected consumers than the cap is rejected.
 
-The runner marks each BP's two upstream entries with `always-forward-votes: true`
+The runner marks each BP's upstream entries with `always-forward-votes: true`
 in both saved study topologies. Routing uses those explicit markers, not stake.
 For other topologies, mark the consumer's own relay entries under `producers`.
 Enabling protection with a bounded cap requires marked links and at least one
@@ -369,6 +372,46 @@ path aliases, monitor failure, interruption and retry:
 python3 scripts/test-vote-traffic-cli.py --binary target/release/sim-cli
 python3 scripts/test-summarize-vote-traffic.py
 ```
+
+## Block producer upstream count
+
+The fixtures give each BP two upstream relays. SPO practice is commonly two
+public relays plus a third that is not registered on chain, so
+`VOTE_STUDY_BP_UPSTREAMS` derives a variant with a different degree:
+
+```sh
+VOTE_STUDY_BP_UPSTREAMS=3 ./scripts/vote-diffusion-study.sh <config> <output> 0
+```
+
+The variant is **derived from the same fixture**, not generated fresh, so every
+other property is identical — locations, stake, relay graph, existing latencies,
+bandwidth, core counts — and a comparison isolates the upstream count. Links are
+added in both directions, matching how the fixture already connects a BP to its
+relays.
+
+Selection is least-loaded first, then nearest. Plain nearest-relay selection put
+105 producers behind one relay on the 1500-node fixture, which no tested
+protected cap can serve and which would dominate the result for reasons
+unrelated to the upstream count. Balanced, the busiest relay serves two.
+
+`VOTE_STUDY_BP_UPSTREAM_LATENCY` chooses the added link's latency. `sampled`
+draws from the source topology's own distance-to-latency pool, the rule
+`generate-topology.py` uses; on the 1500-node fixture that gives a median of
+about 32 ms, because the third relay is not in the producer's rack while its two
+existing ones are (about 0.2 ms). `copy` reuses the producer's existing link
+latency instead, modelling a co-located private relay. **The two bracket a real
+deployment; run both before reading much into the result.**
+
+The topology can also be derived on its own:
+
+```sh
+python3 scripts/add-bp-upstreams.py   ../data/simulation/pseudo-mainnet/topology-v2-1500.yaml /tmp/topology-u3.yaml   --upstreams 3
+python3 scripts/test-add-bp-upstreams.py
+```
+
+A nondefault count adds a `-u<N>` token to every run name and a `bp_upstreams`
+column to `runs.csv`. The default adds neither, so published run names are
+unchanged and archived CSVs read as two.
 
 ## Focused fanout and control-size follow-up
 

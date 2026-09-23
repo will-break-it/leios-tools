@@ -294,11 +294,17 @@ class StudyInterfaceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         with (output / 'runs.csv').open() as stream:
             reader = csv.DictReader(stream)
-            self.assertEqual(reader.fieldnames, list(self.rows[0]) + ['protects_producers', 'announcement_bytes', 'request_bytes'])
+            self.assertEqual(reader.fieldnames, list(self.rows[0]) +
+                             ['protects_producers', 'announcement_bytes', 'request_bytes',
+                              'bp_upstreams'])
             rows = list(reader)
         self.assertEqual(len(rows), 108)
         self.assertEqual(len({r['run'] for r in rows}), 108)
         self.assertTrue(all(r['status'] == 'planned' for r in rows))
+        # The default upstream count adds no run-name token, so names published
+        # before the knob existed still match.
+        self.assertEqual({r['bp_upstreams'] for r in rows}, {'2'})
+        self.assertFalse([r['run'] for r in rows if '-u' in r['run']])
         for name in ['input-sha256.json', 'log-sha256.json', 'revision.txt', 'upstream-revision.txt']:
             self.assertTrue((output / name).is_file(), name)
         checksums = json.loads((output / 'input-sha256.json').read_text())
@@ -309,6 +315,32 @@ class StudyInterfaceTests(unittest.TestCase):
             self.assertIn(f'vote-transport: "{row["transport"]}"', overlay)
             self.assertIn(f'vote-push-fanout: {"null" if row["fanout"] == "all" else row["fanout"]}', overlay)
             self.assertIn('vote-push-fanout-protects-producers: false', overlay)
+
+    def test_a_nondefault_upstream_count_is_named_and_recorded(self):
+        output = self.root / 'upstream-plan'
+        env = {k: v for k, v in os.environ.items() if not k.startswith('VOTE_STUDY_')}
+        env.update(VOTE_STUDY_DRY_RUN='1', VOTE_STUDY_SIZES='1500',
+                   VOTE_STUDY_COMMITTEES='top-stake-seats', VOTE_STUDY_TRANSPORTS='push',
+                   VOTE_STUDY_FANOUTS='8', VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS='true',
+                   VOTE_STUDY_BP_UPSTREAMS='3')
+        result = subprocess.run([str(RUNNER), str(self.archive / 'study-config.yaml'),
+                                 str(output), '0'], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with (output / 'runs.csv').open() as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual([r['bp_upstreams'] for r in rows], ['3'])
+        self.assertIn('-u3-s0', rows[0]['run'])
+        nodes = json.loads((output / 'topology-1500.yaml').read_text())['nodes']
+        degrees = {len(v['producers']) for v in nodes.values() if v.get('stake', 0)}
+        self.assertEqual(degrees, {3})
+
+    def test_an_upstream_count_below_two_is_rejected(self):
+        output = self.root / 'rejected-plan'
+        env = {k: v for k, v in os.environ.items() if not k.startswith('VOTE_STUDY_')}
+        env.update(VOTE_STUDY_DRY_RUN='1', VOTE_STUDY_BP_UPSTREAMS='1')
+        result = subprocess.run([str(RUNNER), str(self.archive / 'study-config.yaml'),
+                                 str(output), '0'], env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == '__main__':
