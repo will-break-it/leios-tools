@@ -1,5 +1,9 @@
 # Linear Leios vote diffusion study
 
+This is the how-to: configuration knobs, the run matrix and reproduction. For what
+was asked, what was found and what it supports, start at the
+[experiment register](vote-diffusion/README.md).
+
 The question is whether simple vote streaming remains feasible with a large
 committee, and whether selective fetching or reduced fanout improves timing,
 bandwidth or verification cost. The comparison covers Linear Leios. Full Haskell

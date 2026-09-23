@@ -1,4 +1,6 @@
-# Focused vote diffusion follow-up
+# VD-2: BP protection and control size
+
+Part of the [vote diffusion experiment register](../vote-diffusion/README.md). Arm names are defined in [transports.md](../vote-diffusion/transports.md); timing is decomposed in [time-budget.md](../vote-diffusion/time-budget.md); limits are listed in [model-gaps.md](../vote-diffusion/model-gaps.md).
 
 This pilot revisits two assumptions in the [108-run study](../vote-diffusion-results-20260910/README.md): whether bounded fanout should protect BP connections, and how pull changes when announcements and requests exceed the original 8-byte assumption. It adds per-node traffic for every case.
 
@@ -28,14 +30,28 @@ Unrestricted push sends **32.684 GB** with a **3.334s** Q95 mean. Protected cap 
 
 At 8/8 bytes, pull traffic comprises **1.258 GB of bodies, 2.784 GB of announcements and 0.107 GB of requests**. Request sizes are included. The 40/40 and 64/64 cases are sensitivity assumptions, not verified wire encodings.
 
-**Absolute node traffic is concentrated at relays.** The selected comparison below shows the unrestricted reference and protected cap 8. The bundle contains all ten per-node reports.
+**Absolute node traffic is concentrated at relays, and bounded push has the lowest peak of any arm.** The bundle contains all ten per-node reports; the five below are the arms compared elsewhere in this report.
 
-| Transport | Role | Total sent GB | Median sent MB/node | Max sent MB/node | Median received MB/node | Max node peak sent Mbit/s |
-|---|---|---:|---:|---:|---:|---:|
-| Unrestricted push | BP | 0.385164 | 0.841 | 0.841 | 1.581 | 0.333 |
-| Unrestricted push | relay | 32.298928 | 25.970 | 153.114 | 30.577 | 60.649 |
-| Protected cap 8 | BP | 0.385164 | 0.841 | 0.841 | 1.240 | 0.333 |
-| Protected cap 8 | relay | 6.994522 | 6.713 | 6.713 | 6.507 | 2.659 |
+| Transport | Role | Total sent GB | Median sent MB/node | Max sent MB/node | Median received MB/node | Median peak sent Mbit/s | Max peak sent Mbit/s |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Unrestricted push | BP | 0.385164 | 0.841 | 0.841 | 1.581 | 0.333 | 0.333 |
+| Unrestricted push | relay | 32.298928 | 25.970 | 153.114 | 30.577 | 10.287 | 60.649 |
+| Protected cap 8 | BP | 0.385164 | 0.841 | 0.841 | 1.240 | 0.333 | 0.333 |
+| Protected cap 8 | relay | 6.994522 | 6.713 | 6.713 | 6.507 | 2.659 | 2.659 |
+| Pull 8/8 | BP | 0.079317 | 0.165 | 0.334 | 0.980 | 0.066 | 0.133 |
+| Pull 8/8 | relay | 4.070045 | 3.173 | 23.078 | 3.550 | 1.257 | 9.144 |
+| Pull 40/40 | BP | 0.340966 | 0.736 | 0.907 | 1.551 | 0.292 | 0.360 |
+| Pull 40/40 | relay | 15.374384 | 12.501 | 72.721 | 14.398 | 4.920 | 28.800 |
+| Pull 64/64 | BP | 0.537250 | 1.164 | 1.333 | 1.980 | 0.461 | 0.528 |
+| Pull 64/64 | relay | 23.852544 | 19.341 | 109.981 | 22.530 | 7.607 | 43.552 |
+
+Protected cap 8 peaks at **2.659 Mbit/s** on its busiest relay, below pull at every tested control size, including 8/8 (9.144). It also reaches Q95 0.505s earlier than pull. Its cost is 1.8x pull's total bytes at 8/8.
+
+Bounded push is flat — every relay forwards exactly eight copies, so its median and maximum peak coincide. Unrestricted push and every pull case keep a heavy tail (60.649 against a 10.287 median; 9.144 against 1.257), because both flood every consumer: one with bodies, the other with announcements.
+
+**Pull replaces copies with smaller copies; it does not remove them.** Pull sends 348,055,165 announcements where unrestricted push sends 347,703,105 bodies. The flood is the same shape. A vote body is 94 bytes, so pull's entire saving is the size ratio of an announcement to a body, and it decays as announcements grow: 11.8x per copy at 8 bytes, 1.5x at 64. Bodies are 30% of pull's traffic at 8/8 and 5% at 64/64.
+
+This locates the lever for a rate-limited hybrid: **cap the announcement fanout, not the body fanout**. Applying this matrix's cap-8 copy ratio (21.7% of consumers) to the announcement flood estimates roughly 1.97 GB at 8/8 — under both pull and protected cap 8. That is an extrapolation from these runs, not a simulated arm; VD-5 in the [experiment register](../vote-diffusion/README.md) is where it gets measured.
 
 No obsolete verifications were measured in these ten runs. The original CPU-stress cases have not been rerun with that instrumentation, so this does not quantify their obsolete work.
 
@@ -55,7 +71,7 @@ The runs keep existing transport behavior for obsolete votes. Obsolete work rema
 
 The [evidence bundle](evidence.tar.gz) contains `breakdown/SUMMARY.md` with quorum availability, exact wire bytes, control-size ratios, message counts, obsolete verification work and per-node distributions. `breakdown/followup.json` retains the full numeric record. Each run has a per-node CSV and summary inside the bundle. The key comparisons are shown above so this PR can be reviewed without opening generated data files.
 
-Q95 means nodes holding 95% of stake each have the votes for a certificate. Each node's certificate threshold is 75% of total voting stake. Q50 is the corresponding availability measure at 50% of stake. Neither is the percentage of votes delivered. The separate bundle-coverage statistic counts receiving nodes without weighting by stake.
+Q95 means nodes holding 95% of stake each have the votes for a certificate. Each node's certificate threshold is **already 75% of total voting stake** — `quorum-weight-fraction: 0.75` — so a request for "the numbers at a 75% quorum" is answered by every row in this report. Q50 and Q95 vary the *observer*, not the threshold: they ask how widely that 75% quorum has become available. Neither is the percentage of votes delivered. The separate bundle-coverage statistic counts receiving nodes without weighting by stake.
 
 Q95 times are measured from the EB's slot boundary and averaged only over EBs that attain Q95. Equal counts do not prove equal EB identities. The fixed cutoff can leave the newest EBs unfinished; timing alone is not evidence of equal availability.
 

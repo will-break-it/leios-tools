@@ -1,4 +1,6 @@
-# Corrected Linear Leios vote diffusion results
+# VD-1: transport baseline
+
+Part of the [vote diffusion experiment register](../vote-diffusion/README.md). Arm names are defined in [transports.md](../vote-diffusion/transports.md); limits are listed in [model-gaps.md](../vote-diffusion/model-gaps.md).
 
 All **108 runs** completed: two network sizes, two committee modes, three matched seeds, and announce/request plus two push deduplication orders crossed with unlimited/22/16/8 fanout. Simulator revision `0769c07310fba223a09d8082e2744013c6856a43`.
 
