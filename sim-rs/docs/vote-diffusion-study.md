@@ -154,6 +154,7 @@ for byte from their bundled evidence.
 cargo test --workspace --locked --offline
 python3 scripts/test-vote-diffusion-study.py
 python3 scripts/test-add-bp-upstreams.py
+python3 scripts/test-compare-vote-matrices.py
 python3 scripts/test-summarize-vote-traffic.py
 python3 scripts/test-vote-traffic-cli.py --binary target/release/sim-cli
 ```
@@ -412,6 +413,30 @@ python3 scripts/test-add-bp-upstreams.py
 A nondefault count adds a `-u<N>` token to every run name and a `bp_upstreams`
 column to `runs.csv`. The default adds neither, so published run names are
 unchanged and archived CSVs read as two.
+
+## Comparing matrices
+
+`summarize-vote-diffusion-followup.py` reports one fixed ten-case matrix.
+`compare-vote-matrices.py` puts the arms of any number of completed matrices in
+a single table, so a new matrix is read against the ones it is meant to be
+compared with:
+
+```sh
+python3 scripts/compare-vote-matrices.py   VD-2=/tmp/vote-followup VD-3=/tmp/vote-u3 --output /tmp/comparison
+```
+
+It applies the same checks as the focused summarizer — frozen input and log
+checksums through the protocol extractor, capture checksums, per-node
+reconciliation against the final network totals — and asserts nothing about
+which configurations a matrix contains. A label defaults to the directory name.
+
+Per-node captures are optional. Without them the byte total comes from the
+rounded figure in the run log, marked as such, and the peak columns read `n/a`:
+a peak cannot be recovered from network totals. Runs that did not pass are an
+error rather than a missing row.
+
+It writes `comparison.md` and `comparison.csv`. Re-running it on the published
+VD-2 bundle reproduces that report's traffic, peak and timing figures.
 
 ## Focused fanout and control-size follow-up
 
