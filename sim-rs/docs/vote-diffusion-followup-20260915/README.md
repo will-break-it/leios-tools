@@ -93,7 +93,7 @@ python3 scripts/summarize-vote-diffusion-followup.py "$run_dir" \
   --output "$run_dir/reproduced"
 ```
 
-The summarizer verifies frozen input/log/capture hashes, successful completion, requested duration, topology membership and control-message sizes. It reconciles each per-node capture with the final global summary before generating the tables. `SUMMARY.md`, `followup.json`, and every per-node CSV/summary reproduce byte for byte. The general extractor's `updated_utc` timestamp is not part of this deterministic comparison.
+The summarizer verifies frozen input/log/capture hashes, successful completion, requested duration, topology membership and control-message sizes. It reconciles each per-node capture with the final global summary before generating the tables. `SUMMARY.md`, `followup.json`, and every per-node CSV/summary reproduce byte for byte **at the pinned analysis revision**. The current scripts add a Q75 availability column, which these logs predate, so they print `n/a` there and their `SUMMARY.md` differs by that column. Check out `analysis-revision.txt` to verify the archive byte for byte. The general extractor's `updated_utc` timestamp is not part of this deterministic comparison.
 
 To rerun simulations, check out the simulator revision above in a separate worktree and use the saved base config:
 

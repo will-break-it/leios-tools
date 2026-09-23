@@ -260,12 +260,16 @@ that plan directory, or extract the exact overlay from the published input
 archive. The runner produces the complete committee, seed, transport and fanout
 settings together; separate transport presets are unnecessary.
 
-Record quorum attainment and misses per EB, Q50/Q95 attainment, vote
+Record quorum attainment and misses per EB, Q50/Q75/Q95 attainment, vote
 bodies generated, actual eligible stake, total protocol bytes, completed
 verifications, accepted arrivals and pending arrivals. Keep a fixed scenario
 and seed across each comparison. The reported Q95 time is a mean of per-EB times
 at which nodes holding 95% of stake each have a quorum; it is not a worst-case
-deadline guarantee. Preserve miss counts alongside conditional timing averages.
+deadline guarantee. Q75 is the same measure at 75% of stake. It varies the
+observer, not the certificate threshold, which `quorum-weight-fraction` fixes at
+75% of total active stake in every arm. Logs written before the Q75 observer
+existed have no such line; the extractor leaves the field absent for them rather
+than inventing a value, so archived results re-extract unchanged. Preserve miss counts alongside conditional timing averages.
 
 ## Limits on transfer to the Haskell node
 

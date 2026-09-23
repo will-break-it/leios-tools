@@ -39,7 +39,8 @@ caps reached quorum on 0 of 26 EBs, so they have no meaningful time.
 | `pull-offer-all` 64/64 | 0.136s | 0.171s | **0.850s** | 3.850s | +3.150s |
 
 Q0 is the first node anywhere, Q50 the stake-weighted median node, Q95 the
-95th-percentile node by stake. Each is the moment that node's own tally crosses
+95th-percentile node by stake. **Q75 is now instrumented too** and appears from
+VD-3 onward; these logs predate it, so it is absent here rather than guessed. Each is the moment that node's own tally crosses
 75% of total active stake. Q95 is an availability quantile across nodes — it is
 not "95% of the votes" and not a worst-case guarantee.
 
