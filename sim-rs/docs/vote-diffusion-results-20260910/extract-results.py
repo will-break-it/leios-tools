@@ -35,10 +35,17 @@ def extract(text,pattern,required=True):
         return None
     return matches[-1]
 
-def quorum(text,label,total):
+def quorum(text,label,total,required=True):
+    pattern=r'^  Quorum at '+label+r'[^\n]+'
+    found=extract(text,pattern,False)
+    # Logs written before the Q75 observer existed have no such line.  Leave
+    # the field absent rather than inventing a value: archived results must
+    # re-extract unchanged, including runs that generated no EB at all.
+    if found is None and not required: return None
     if total == 0:
         return dict(reached=0,total=0,by_vote_deadline=0,vote_deadline_s=None,by_inclusion=0,inclusion_s=None,mean_s=None,median_s=None,p95_s=None,max_s=None)
-    line=extract(text,r'^  Quorum at '+label+r'[^\n]+').group(0)
+    if found is None: raise ValueError('Missing metric: '+pattern)
+    line=found.group(0)
     m=extract(line,r': (\d+) of (\d+) EB\(s\) reached one, (\d+) of them by the ([\d.]+)s deadline and (\d+) by the ([\d.]+)s inclusion deadline\.')
     q=dict(zip(['reached','total','by_vote_deadline','vote_deadline_s','by_inclusion','inclusion_s'],[int(m[1]),int(m[2]),int(m[3]),float(m[4]),int(m[5]),float(m[6])]))
     m=extract(line,r'Average ([\d.]+)s from t0 \(median ([\d.]+), p95 ([\d.]+), max ([\d.]+)\)',False)
@@ -73,6 +80,8 @@ for row in runs:
         r['eligible_stake_fraction']=topo['seated_stake']/topo['total_stake'] if row['committee']=='top-stake-seats' else 1.0
         r['quorum_first']=quorum(final,'the first node anywhere',r['ebs_generated'])
         r['quorum_median']=quorum(final,'the stake-weighted median node',r['ebs_generated'])
+        q75=quorum(final,'the 75th-percentile node by stake',r['ebs_generated'],False)
+        if q75 is not None: r['quorum_q75']=q75
         r['quorum_p95']=quorum(final,'the 95th-percentile node by stake',r['ebs_generated'])
         m=extract(final,r'(\d+) Vote body message\(s\) were sent\. (\d+) of them were received .*? (\d+) of those .*?; (\d+) accepted; (\d+) pending; (\d+) verification\(s\) completed')
         for field,value in zip(['bodies_sent','bodies_received','redundant_arrivals','accepted','pending','verifications'],m.groups()): r[field]=int(value)

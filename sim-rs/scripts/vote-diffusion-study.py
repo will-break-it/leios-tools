@@ -4,6 +4,7 @@ import argparse
 import csv
 import datetime
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -16,7 +17,8 @@ import time
 
 HERE = Path(__file__).resolve().parents[1]
 FIELDS = ['run', 'seed', 'nodes', 'committee', 'transport', 'fanout', 'slots',
-          'status', 'started_utc', 'finished_utc', 'elapsed_s', 'exit_code', 'protects_producers', 'announcement_bytes', 'request_bytes']
+          'status', 'started_utc', 'finished_utc', 'elapsed_s', 'exit_code', 'protects_producers',
+          'announcement_bytes', 'request_bytes', 'bp_upstreams']
 
 
 def atomic(path, text):
@@ -99,21 +101,29 @@ def build_binary(root, revision):
     raise ValueError(f'Executable revision differs from source {revision.strip()}: {version.strip()}')
 
 
-def study_topology(size):
+def study_topology(size, upstreams=2, latency='sampled'):
     source = 'topology-v2-cip.yaml' if size == '750' else 'topology-v2-1500.yaml'
     topology = json.loads((HERE.parent / 'data/simulation/pseudo-mainnet' / source).read_text())
     nodes = topology['nodes']
+    if upstreams != 2:
+        # Derived from the same fixture rather than generated fresh, so a
+        # comparison against the two-upstream runs isolates the upstream count.
+        spec = importlib.util.spec_from_file_location('bpup', HERE / 'scripts/add-bp-upstreams.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.add_upstreams(topology, upstreams, latency=latency)
     for name, node in nodes.items():
         if size == '1500':
             node['cpu-core-count'] = 4
             for peer in node.get('producers', {}).values():
                 peer['bandwidth-bytes-per-second'] = 1250000
-        # These two study fixtures separate BPs and their two upstream relays.
+        # These study fixtures separate BPs and their upstream relays.
         # Make that assumption explicit in the saved topology, not in routing.
         if node.get('stake', 0):
             peers = node.get('producers', {})
-            if len(peers) != 2 or any(nodes[p].get('stake', 0) for p in peers):
-                raise ValueError(f'{name}: expected a BP with two non-staking upstream relays')
+            if len(peers) != upstreams or any(nodes[p].get('stake', 0) for p in peers):
+                raise ValueError(
+                    f'{name}: expected a BP with {upstreams} non-staking upstream relays')
             for peer in peers.values():
                 peer['always-forward-votes'] = True
     return topology
@@ -140,6 +150,10 @@ def main(argv=None):
     protects = flag('VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS', 'false', 'true', 'false')
     announcement_bytes = positive(os.environ.get('VOTE_STUDY_ANNOUNCEMENT_BYTES', '8'))
     request_bytes = positive(os.environ.get('VOTE_STUDY_REQUEST_BYTES', '8'))
+    upstreams = positive(os.environ.get('VOTE_STUDY_BP_UPSTREAMS', '2'))
+    if upstreams < 2:
+        raise ValueError('VOTE_STUDY_BP_UPSTREAMS must be at least 2')
+    upstream_latency = choices('VOTE_STUDY_BP_UPSTREAM_LATENCY', 'sampled', {'sampled', 'copy'})[0]
     seeds = args.seeds or ['0']
     if any(not s.isascii() or not s.isdigit() for s in seeds):
         raise ValueError('Seeds must be nonnegative integers')
@@ -168,7 +182,8 @@ def main(argv=None):
     atomic(root / 'upstream-revision.txt', upstream + '\n')
     shutil.copyfile(Path(__file__), root / 'runner.py')
     for size in sizes:
-        (root / f'topology-{size}.yaml').write_text(json.dumps(study_topology(size)))
+        (root / f'topology-{size}.yaml').write_text(
+            json.dumps(study_topology(size, upstreams, upstream_latency)))
     rows = []
     arms = [('announce-then-request', 'all')] if 'announce-then-request' in transports else []
     arms += [(transport, fanout) for fanout in fanouts
@@ -178,7 +193,11 @@ def main(argv=None):
             for committee in committees:
                 for transport, fanout in arms:
                     protection = str(protects and transport != 'announce-then-request' and fanout != 'all').lower()
-                    name = f'{size}-{committee}-{transport}-f{fanout}-bp{protection}-a{announcement_bytes}-r{request_bytes}-s{seed}'
+                    # Only a nondefault upstream count adds a token, so every
+                    # run name published before this knob existed is unchanged.
+                    upstream_token = '' if upstreams == 2 else f'-u{upstreams}'
+                    name = (f'{size}-{committee}-{transport}-f{fanout}-bp{protection}'
+                            f'-a{announcement_bytes}-r{request_bytes}{upstream_token}-s{seed}')
                     cap = 'null' if fanout == 'all' else str(int(fanout))
                     (root / (name + '.yaml')).write_text(
                         f'committee-selection-algorithm: "{committee}"\ncommittee-seat-count: 900\n'
@@ -187,7 +206,8 @@ def main(argv=None):
                         f'vote-transport-echo-to-source: false\n'
                         f'vote-announcement-size-bytes: {announcement_bytes}\nvote-request-size-bytes: {request_bytes}\n')
                     rows.append(dict(zip(FIELDS, [name, seed, size, committee, transport, fanout, slots,
-                                                'planned', '', '', '', '', protection, announcement_bytes, request_bytes])))
+                                                'planned', '', '', '', '', protection, announcement_bytes,
+                                                request_bytes, upstreams])))
     save_runs(root, rows)
     inputs = manifest(root, [p.name for p in root.glob('*.yaml')] + ['source.patch', 'runner.py'])
     write_json(root / 'input-sha256.json', inputs)
