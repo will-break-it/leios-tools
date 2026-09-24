@@ -1,8 +1,9 @@
-# Vote transport arms: names and exact rules
+# Vote transport rules
 
-Every experiment uses these names. Each is one forwarding rule, stated in full,
-with the configuration that produces it. If a table elsewhere says `push-cap-8-bp`,
-this is what ran.
+Each strategy is one forwarding rule, stated in full, with the configuration
+that produces it. The first two are the live candidates; the bounded rules after
+them were tested and [ruled out](README.md#ruled-out), and are kept here so the
+archived runs remain readable.
 
 A node runs the rule once per vote bundle, at the moment it first accepts that
 bundle. `consumers` are its downstream peers in the topology. The peer a bundle
@@ -19,47 +20,6 @@ vote-push-fanout: null
 ```
 
 Unrestricted. This is the arm the prototype implements today.
-
-## `push-cap-N`
-
-> On first acceptance, send the **body** to `N` consumers, chosen by ranking every
-> eligible consumer on `hash(seed, this node, bundle id, peer)` and taking the
-> lowest `N`.
-
-```yaml
-vote-transport: "push"
-vote-push-fanout: N            # 22, 16 or 8 in VD-2
-vote-push-fanout-protects-producers: false
-```
-
-The selection is keyed on the bundle, so **each vote takes its own subgraph**.
-It is a pure function of the seed: identical across runs, platforms and shard
-layouts, and independent of arrival order. There is no repair mechanism and no
-delivery guarantee — a node that no selected path reaches never gets that vote.
-`N` bounds how many copies *one node relays*, not how many copies of a vote
-cross the network.
-
-Run-name token: `f22`, `f16`, `f8`; `fall` for `push-all`.
-
-## `push-cap-N-bp`
-
-> As `push-cap-N`, but consumers reached over a link marked
-> `always-forward-votes: true` are ranked first and take their places **inside
-> the same total cap `N`**.
-
-```yaml
-vote-transport: "push"
-vote-push-fanout: N
-vote-push-fanout-protects-producers: true
-```
-
-A relay protecting one BP at cap 22 has 21 places left for other consumers. The
-protected arm gets no extra copy — this compares *which* recipients a fixed
-budget buys. The study runner marks each BP's upstream relay links in the saved
-topology; routing reads those markers, not stake. A node with more protected
-consumers than the cap is rejected.
-
-Run-name token: `bptrue` (`bpfalse` otherwise).
 
 ## `pull-offer-all`
 
@@ -90,6 +50,53 @@ sensitivity points, not verified wire encodings.
 
 Run-name token: `announce-then-request`, plus `a8-r8` / `a40-r40` / `a64-r64`.
 
+## Ruled out: bounded fanout
+
+The three rules below cap how many peers a node forwards to. They save bandwidth
+and lose certification — see [Ruled out](README.md#ruled-out). They are not
+candidates; this section documents what the archived arms did.
+
+### `push-cap-N`
+
+> On first acceptance, send the **body** to `N` consumers, chosen by ranking every
+> eligible consumer on `hash(seed, this node, bundle id, peer)` and taking the
+> lowest `N`.
+
+```yaml
+vote-transport: "push"
+vote-push-fanout: N            # 22, 16 and 8 were tested
+vote-push-fanout-protects-producers: false
+```
+
+The selection is keyed on the bundle, so **each vote takes its own subgraph**.
+It is a pure function of the seed: identical across runs, platforms and shard
+layouts, and independent of arrival order. There is no repair mechanism and no
+delivery guarantee — a node that no selected path reaches never gets that vote.
+`N` bounds how many copies *one node relays*, not how many copies of a vote
+cross the network.
+
+Run-name token: `f22`, `f16`, `f8`; `fall` for `push-all`.
+
+### `push-cap-N-bp`
+
+> As `push-cap-N`, but consumers reached over a link marked
+> `always-forward-votes: true` are ranked first and take their places **inside
+> the same total cap `N`**.
+
+```yaml
+vote-transport: "push"
+vote-push-fanout: N
+vote-push-fanout-protects-producers: true
+```
+
+A relay protecting one BP at cap 22 has 21 places left for other consumers. The
+protected arm gets no extra copy — this compares *which* recipients a fixed
+budget buys. The study runner marks each BP's upstream relay links in the saved
+topology; routing reads those markers, not stake. A node with more protected
+consumers than the cap is rejected.
+
+Run-name token: `bptrue` (`bpfalse` otherwise).
+
 ## Duplicate handling: `push` vs `push-late-dedupe`
 
 Orthogonal to the rules above, and about *when a node records a vote as seen*,
@@ -102,8 +109,9 @@ never about when it sends one.
 
 Both discard copies of an already verified bundle. The inspected Haskell
 prototype records a vote as known only after verification, so it behaves like
-`push-late-dedupe`. VD-1 covers both; **VD-2 uses `push` only**, so VD-2's
-conclusions carry no claim about verification load under the prototype's order.
+`push-late-dedupe`. The 108-run study covers both; the later follow-up uses
+`push` only, so its conclusions carry no claim about verification load under the
+prototype's order.
 
 ## Run-name grammar
 

@@ -37,9 +37,9 @@ class Comparator(unittest.TestCase):
             return list(csv.DictReader(stream)), output
 
     def test_published_arms_reproduce_their_traffic_and_timing(self):
-        rows, output = self.run_compare(f'VD-2={self.matrix}')
+        rows, output = self.run_compare(f'follow-up={self.matrix}')
         self.assertEqual(len(rows), 10)
-        self.assertEqual({r['matrix'] for r in rows}, {'VD-2'})
+        self.assertEqual({r['matrix'] for r in rows}, {'follow-up'})
         by_arm = {(r['transport'], r['cap'], r['protect_bp'], r['announce_request_bytes']): r
                   for r in rows}
         unrestricted = by_arm[('push', 'all', 'false', '8/8')]

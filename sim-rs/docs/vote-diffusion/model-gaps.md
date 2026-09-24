@@ -1,6 +1,6 @@
 # What these runs do not model
 
-Every number in VD-1 and VD-2 comes from an honest network with no flow control
+Every number in these studies comes from an honest network with no flow control
 and no request timeouts. This page states each gap and what it disqualifies, so
 a reader can tell which conclusions survive it.
 
@@ -26,9 +26,9 @@ Consequences:
   says nothing about pull under a grinding or withholding adversary, and the
   0.5s gap to push cannot be traded against attack resistance on this evidence.
 - **Any pull or hybrid design needs a request policy this study has not tested**:
-  timeout, retry, hedging across k upstreams, or serving limits. VD-5 is where
-  those get measured; until then, "pull costs half a second" is conditional on a
-  policy nobody has specified.
+  timeout, retry, hedging across several upstreams, or serving limits. Until
+  those are measured, pull's timing figure is conditional on a policy nobody has
+  specified.
 - Push has no equivalent dependency — a pushed body needs no cooperation from
   the receiver's chosen peer — but bounded push has its own failure mode, below.
 
@@ -40,9 +40,9 @@ accepted for the first pass, not why it is closed.
 
 `push-cap-N` picks recipients by `hash(seed, node, bundle, peer)`. Each vote
 takes its own subgraph, and **delivery to any particular node is not guaranteed**.
-Nothing detects or repairs a node the selection skipped. Across VD-1's 72 capped
-runs this was not a partial loss: cap 8 produced **zero L1 endorsements in every
-run**, and caps 16 and 8 never reached Q50. The same objection applies to capping
+Nothing detects or repairs a node the selection skipped. Across 72 capped runs
+this was not a partial loss: a cap of 8 produced **zero L1 endorsements in every
+run**, and caps of 16 and 8 never reached Q50. The same objection applies to capping
 announcement fanout — no offer means no request — so a bounded-coverage rule is
 ruled out on either message class, and the bandwidth lever belongs on the
 serving side instead.
@@ -63,11 +63,11 @@ order matter:
 | `push` (mark seen on arrival) | 1.00 |
 | `push-late-dedupe` (mark seen after verification) | **9.69** |
 
-The inspected Haskell prototype uses the second order. **VD-2 runs only the
-first**, so VD-2's BP-protection and control-size findings carry no claim about
-verification load in the prototype. VD-1 covers both and found the second order
-costs 0.46s of Q95 time at 1500 nodes and reduces endorsements in the
-everyone-votes arm.
+The inspected Haskell prototype uses the second order. **The control-size
+follow-up runs only the first**, so its findings carry no claim about
+verification load in the prototype. The 108-run study covers both and found the
+second order costs 0.46s of Q95 time at 1500 nodes and reduces endorsements in
+the everyone-votes arm.
 
 ## 4. No flow control or per-peer serialization
 
@@ -93,7 +93,7 @@ node without re-checking this.
 
 ## 6. Scope of the current evidence
 
-| | VD-1 | VD-2 |
+| | Push vs pull | Control size |
 |---|---|---|
 | Seeds | 0, 1, 2 | **0 only** |
 | Nodes | 750, 1500 | 1500 |
@@ -102,9 +102,8 @@ node without re-checking this.
 | BP upstreams | 2 | 2 |
 | Per-node traffic | no (network totals) | yes, all 1500 nodes |
 
-The BP-protection result — the basis of the bounded-push recommendation — rests
-on **one seed**. VD-6 exists to replicate it. Timing means are conditional on
-attainment and cover 20 of 26 EBs; the 400-slot cutoff leaves the newest EBs
+The three-relay comparison is one seed so far; seeds 1 and 2 are running.
+Timing means are conditional on attainment and cover 20 of 26 EBs; the 400-slot cutoff leaves the newest EBs
 unfinished, and equal attainment counts across arms do not prove the same EBs.
 
 ## What the evidence does support
@@ -114,13 +113,13 @@ Stated narrowly, so the claims can be checked:
 1. On an honest 1500-node network with these parameters, **no transport choice
    comes close to the 7.000s voting deadline**; the spread is 0.334s to 0.850s
    inside a 4.000s window.
-2. **Peak relay bandwidth varies by 23x across the arms** (2.66 to 60.65 Mbit/s)
-   while arrival time varies by 0.5s. Bandwidth is the axis worth optimizing.
+2. **Peak relay bandwidth differs 6.6x between the two strategies** (9.14
+   against 60.65 Mbit/s) while arrival time differs by 0.5s, or 0.2s with a
+   third upstream relay. Bandwidth is the axis worth optimizing.
 3. **Pull's advantage is entirely the size ratio between an announcement and a
    94-byte body**, and disappears as announcements grow. Its copy count equals
    unrestricted push's.
-4. **Unprotected hash-sampled fanout loses quorum**; the same cap with BP links
-   protected does not, in one seed.
+4. **Bounded fanout loses certification**, on either message class.
 
 Nothing here supports a claim about the Haskell node's throughput, about
 behaviour under attack, or about a pull design with a request policy that has

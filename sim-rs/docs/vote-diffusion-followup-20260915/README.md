@@ -1,8 +1,8 @@
-# VD-2: BP protection and control size
+# Control-message size and per-node traffic
 
-Part of the [vote diffusion experiment register](../vote-diffusion/README.md). Arm names are defined in [transports.md](../vote-diffusion/transports.md); timing is decomposed in [time-budget.md](../vote-diffusion/time-budget.md); limits are listed in [model-gaps.md](../vote-diffusion/model-gaps.md).
+Part of the [vote diffusion findings](../vote-diffusion/README.md). Arm names are defined in [transports.md](../vote-diffusion/transports.md); timing is decomposed in [time-budget.md](../vote-diffusion/time-budget.md); limits are listed in [model-gaps.md](../vote-diffusion/model-gaps.md).
 
-This pilot revisits two assumptions in the [108-run study](../vote-diffusion-results-20260910/README.md): whether bounded fanout should protect BP connections, and how pull changes when announcements and requests exceed the original 8-byte assumption. It adds per-node traffic for every case.
+This pilot revisits two assumptions in the [108-run study](../vote-diffusion-results-20260910/README.md): whether bounded fanout should protect BP connections, and how pull changes when announcements and requests exceed the original 8-byte assumption. **The bounded-fanout arms are a [ruled-out direction](../vote-diffusion/README.md#ruled-out)** and are retained as evidence, not as candidates; the control-size and per-node traffic results stand on their own. It adds per-node traffic for every case.
 
 The matrix has ten completed 400-slot runs at 1500 nodes, using top-stake-seats and seed 0. Every push case uses `push`, which marks a vote seen on arrival. `push-late-dedupe`, which marks it seen only after verification and is the order the inspected Haskell prototype uses, is not in this matrix. The 458 BPs carry the voting stake; 1042 relays carry no stake. The topology and load match the original seed-0 reference cases. This is one seed and one committee, so it does not repeat the everyone-votes CPU stress test or establish a generally safe fanout.
 
@@ -53,7 +53,7 @@ Bounded push is flat — every relay forwards exactly eight copies, so its media
 
 An earlier revision of this report read that as a case for capping the announcement fanout. **That is withdrawn.** A node that receives no offer sends no request, so capping offers breaks coverage exactly as capping bodies does — and the [108-run study](../vote-diffusion-results-20260910/README.md) shows what that costs: across its 72 capped runs, cap 8 produced zero L1 endorsements and caps 16 and 8 never reached Q50. Offers have to reach everyone.
 
-The bandwidth levers that keep coverage are aggregating offers so one message carries several identifiers, and rate-limiting the **serving** side rather than the offering side, which is the shape EB fetch already uses. Bodies already move along a near-spanning tree with zero redundant arrivals, so there is nothing to save there. VD-5 in the [experiment register](../vote-diffusion/README.md) is where the serving limit gets measured.
+The bandwidth levers that keep coverage are aggregating offers so one message carries several identifiers, and rate-limiting the **serving** side rather than the offering side, which is the shape EB fetch already uses. Bodies already move along a near-spanning tree with zero redundant arrivals, so there is nothing to save there. The [findings page](../vote-diffusion/README.md) tracks the serving limit as the next experiment.
 
 No obsolete verifications were measured in these ten runs. The original CPU-stress cases have not been rerun with that instrumentation, so this does not quantify their obsolete work.
 

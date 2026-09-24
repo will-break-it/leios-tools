@@ -2,7 +2,7 @@
 
 This is the how-to: configuration knobs, the run matrix and reproduction. For what
 was asked, what was found and what it supports, start at the
-[experiment register](vote-diffusion/README.md).
+[findings page](vote-diffusion/README.md).
 
 The question is whether simple vote streaming remains feasible with a large
 committee, and whether selective fetching or reduced fanout improves timing,
@@ -422,7 +422,7 @@ a single table, so a new matrix is read against the ones it is meant to be
 compared with:
 
 ```sh
-python3 scripts/compare-vote-matrices.py   VD-2=/tmp/vote-followup VD-3=/tmp/vote-u3 --output /tmp/comparison
+python3 scripts/compare-vote-matrices.py   two-relay=/tmp/vote-followup three-relay=/tmp/vote-u3 --output /tmp/comparison
 ```
 
 It applies the same checks as the focused summarizer — frozen input and log
@@ -436,7 +436,7 @@ a peak cannot be recovered from network totals. Runs that did not pass are an
 error rather than a missing row.
 
 It writes `comparison.md` and `comparison.csv`. Re-running it on the published
-VD-2 bundle reproduces that report's traffic, peak and timing figures.
+published follow-up bundle reproduces that report's traffic, peak and timing figures.
 
 ## Focused fanout and control-size follow-up
 
