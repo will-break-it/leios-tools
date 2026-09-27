@@ -12,8 +12,10 @@ reconciliation against the final network totals -- but asserts nothing about
 which configurations a matrix should contain.
 
 Per-node captures are optional. Without them the byte total comes from the
-rounded figure in the run log and the peak columns read `n/a`, because a peak
-cannot be recovered from network totals.
+rounded figure in the run log, `wire_gb_exact` reads `false`, and the peak
+columns read `n/a`, because a peak cannot be recovered from network totals. A
+matrix that has captures but no checksum manifest is an error, not a matrix
+without captures.
 """
 
 import argparse
@@ -24,6 +26,7 @@ import json
 import statistics
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -40,15 +43,22 @@ def load_traffic():
 
 traffic = load_traffic()
 
-COLUMNS = ['matrix', 'seed', 'nodes', 'bp_upstreams', 'transport', 'cap', 'protect_bp',
-           'announce_request_bytes', 'ebs', 'q50', 'q75', 'q95', 'q95_by_deadline',
-           'q75_mean_s', 'q95_mean_s', 'endorsements', 'wire_gb',
-           'relay_median_peak_mbit_s', 'relay_max_peak_mbit_s', 'bp_max_peak_mbit_s']
-
-HEADINGS = ['Matrix', 'Seed', 'Nodes', 'Upstreams', 'Transport', 'Cap', 'Protect BP',
-            'Announce/request B', 'EBs', 'Q50', 'Q75', 'Q95', 'Q95 by deadline',
-            'Q75 mean s', 'Q95 mean s', 'Endorsements', 'Wire GB',
-            'Relay median peak Mbit/s', 'Relay max peak Mbit/s', 'BP max peak Mbit/s']
+# One list, so a column and its heading cannot drift apart.
+SCHEMA = [
+    ('matrix', 'Matrix'), ('seed', 'Seed'), ('nodes', 'Nodes'),
+    ('bp_upstreams', 'Upstreams'), ('upstream_latency', 'Upstream latency'),
+    ('transport', 'Transport'), ('cap', 'Cap'), ('protect_bp', 'Protect BP'),
+    ('announce_request_bytes', 'Announce/request B'), ('ebs', 'EBs'),
+    ('q50', 'Q50'), ('q75', 'Q75'), ('q95', 'Q95'),
+    ('q95_by_deadline', 'Q95 by deadline'), ('q75_mean_s', 'Q75 mean s'),
+    ('q95_mean_s', 'Q95 mean s'), ('endorsements', 'Endorsements'),
+    ('wire_gb', 'Wire GB'), ('wire_gb_exact', 'Wire GB exact'),
+    ('relay_median_peak_mbit_s', 'Relay median peak Mbit/s'),
+    ('relay_max_peak_mbit_s', 'Relay max peak Mbit/s'),
+    ('bp_max_peak_mbit_s', 'BP max peak Mbit/s'),
+]
+COLUMNS = [key for key, _ in SCHEMA]
+HEADINGS = [heading for _, heading in SCHEMA]
 
 
 def fmt(value, digits=3):
@@ -58,6 +68,12 @@ def fmt(value, digits=3):
 def verify(root, manifest):
     path = root / manifest
     if not path.is_file():
+        # Captures are optional, a lost manifest is not: without it the peak
+        # columns would silently read n/a on a matrix that did capture them.
+        present = sorted(p.name for p in root.glob('*.vote-traffic.json'))
+        if present:
+            raise ValueError(
+                f'{root}: {len(present)} capture(s) present but {manifest} is missing')
         return {}
     checksums = json.loads(path.read_text())
     for name, expected in checksums.items():
@@ -67,18 +83,23 @@ def verify(root, manifest):
     return checksums
 
 
-def peaks(root, run, captures):
+def peaks(root, run, captures, topologies):
     """Per-role peak rates, or None when the matrix captured no per-node traffic."""
     filename = run['run'] + '.vote-traffic.json'
     if filename not in captures:
+        if (root / filename).is_file():
+            raise ValueError(f'Capture missing from checksum manifest: {filename}')
         return None
     report = traffic.load(root / filename)
     if report['seed'] != int(run['seed']):
         raise ValueError(f"Capture seed differs from runs.csv: {run['run']}")
     duration = int(run['slots'])
     nodes = traffic.summarize(report, duration)
-    topology = json.loads((root / f"topology-{run['nodes']}.yaml").read_text())['nodes']
-    if {row['name'] for row in nodes} != set(topology):
+    size = run['nodes']
+    if size not in topologies:
+        topologies[size] = set(
+            json.loads((root / f'topology-{size}.yaml').read_text())['nodes'])
+    if {row['name'] for row in nodes} != topologies[size]:
         raise ValueError(f"Capture nodes differ from topology: {run['run']}")
     traffic.reconcile(nodes, (root / (run['run'] + '.txt')).read_text(), duration)
     result = {'total_sent_bytes': sum(row['sent_bytes'] for row in nodes)}
@@ -88,19 +109,39 @@ def peaks(root, run, captures):
     return result
 
 
+def extract(root):
+    """Run the protocol extractor without writing into the matrix directory.
+
+    The extractor saves results.json and RESULTS.md beside its inputs. Comparing
+    is a read; mirroring the directory as symlinks keeps a published, checksummed
+    run directory untouched and lets the comparator read a read-only mount.
+    """
+    with tempfile.TemporaryDirectory() as mirror:
+        target = Path(mirror)
+        for entry in root.iterdir():
+            (target / entry.name).symlink_to(entry)
+        done = subprocess.run([sys.executable, str(EXTRACTOR), str(target)])
+        if done.returncode:
+            # The extractor exits nonzero for a parse failure or any run that
+            # did not pass, so say which matrix rather than surfacing a bare
+            # CalledProcessError from a temporary path the caller never named.
+            raise ValueError(f'{root}: the protocol extractor rejected this matrix')
+        return json.loads((target / 'results.json').read_text())
+
+
 def collect(label, root):
-    subprocess.run([sys.executable, str(EXTRACTOR), str(root)], check=True)
-    extracted = json.loads((root / 'results.json').read_text())
+    extracted = extract(root)
     results = {r['run']: r for r in extracted['results']}
     with (root / 'runs.csv').open() as stream:
         runs = list(csv.DictReader(stream))
     captures = verify(root, 'vote-traffic-sha256.json')
+    topologies = {}
     rows = []
     for run in runs:
         if run['status'] != 'passed':
             raise ValueError(f"{label}: {run['run']} is {run['status']}, not a result")
         protocol = results[run['run']]
-        measured = peaks(root, run, captures)
+        measured = peaks(root, run, captures, topologies)
         q75, q95 = protocol.get('quorum_q75'), protocol['quorum_p95']
         rows.append({
             'matrix': label,
@@ -108,6 +149,8 @@ def collect(label, root):
             'nodes': protocol['nodes'],
             # Absent in CSVs written before the knob existed, which were all two.
             'bp_upstreams': run.get('bp_upstreams') or '2',
+            # Absent in CSVs written before the knob existed, which all sampled.
+            'upstream_latency': run.get('bp_upstream_latency') or 'sampled',
             'transport': protocol['transport'],
             'cap': protocol['fanout'],
             'protect_bp': protocol['protects_producers'],
@@ -120,8 +163,11 @@ def collect(label, root):
             'q75_mean_s': fmt(q75['mean_s']) if q75 else 'n/a',
             'q95_mean_s': fmt(q95['mean_s']),
             'endorsements': protocol['l1_endorsements'],
+            # One numeric type in the column; the provenance rides beside it,
+            # so the CSV stays parseable when a matrix captured no traffic.
             'wire_gb': (f"{measured['total_sent_bytes'] / 1e9:.6f}" if measured
-                        else f"{protocol['wire_mb_rounded'] / 1000:.3f} (rounded)"),
+                        else f"{protocol['wire_mb_rounded'] / 1000:.6f}"),
+            'wire_gb_exact': 'true' if measured else 'false',
             'relay_median_peak_mbit_s': fmt(measured['relay']['median']) if measured and measured['relay'] else 'n/a',
             'relay_max_peak_mbit_s': fmt(measured['relay']['max']) if measured and measured['relay'] else 'n/a',
             'bp_max_peak_mbit_s': fmt(measured['BP']['max']) if measured and measured['BP'] else 'n/a',
@@ -131,6 +177,9 @@ def collect(label, root):
 
 def markdown(rows):
     lines = ['# Vote diffusion matrix comparison', '',
+             'Wire GB is exact when the matrix captured per-node traffic and the rounded '
+             'figure from the run log otherwise; the Wire GB exact column says which. ',
+             '',
              'Peaks are node totals across outgoing links in fixed one-second windows, counted '
              'when queued for transmission. They are neither instantaneous nor sliding-window '
              'link throughput, and the bandwidth limit applies to each link, not each node.',

@@ -33,6 +33,7 @@ import random
 import sys
 from pathlib import Path
 
+sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 
 
@@ -42,6 +43,10 @@ def load_generator():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+# The generator is stateless, so load it once rather than per derivation.
+gen = load_generator()
 
 
 def relays_and_producers(nodes):
@@ -73,7 +78,6 @@ def choose(gen, nodes, bp, relays, taken, strategy, rng, load):
 
 
 def add_upstreams(topology, target, strategy='nearest', seed=0, latency='sampled'):
-    gen = load_generator()
     source = gen.analyze_source(topology)
     nodes = topology['nodes']
     relays, producers = relays_and_producers(nodes)
@@ -102,13 +106,19 @@ def add_upstreams(topology, target, strategy='nearest', seed=0, latency='sampled
             link = dict(template)
             if latency == 'sampled':
                 link['latency-ms'] = round(gen.sample_latency(source, distance, rng), 4)
-            elif not template:
-                raise ValueError(f'{bp}: --latency copy needs an existing link to copy')
+            elif 'latency-ms' not in link:
+                raise ValueError(
+                    f'{bp}: --latency copy needs an existing link carrying latency-ms')
             peers[relay] = link
             # Reciprocal, matching the fixtures: the relay serves the BP and
             # the BP publishes to it.
             back = dict(link)
-            nodes[relay].setdefault('producers', {})[bp] = back
+            reverse = nodes[relay].setdefault('producers', {})
+            if bp in reverse:
+                raise ValueError(
+                    f'{relay} already lists {bp} as a producer; adding the reciprocal '
+                    'link would overwrite it')
+            reverse[bp] = back
             added += 1
     return added
 

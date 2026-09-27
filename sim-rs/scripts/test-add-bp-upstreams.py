@@ -3,9 +3,11 @@
 import copy
 import importlib.util
 import json
+import sys
 import unittest
 from pathlib import Path
 
+sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 
 
@@ -158,6 +160,20 @@ class StudyRunnerIntegration(unittest.TestCase):
                 for relay in node['producers']:
                     serving[relay] = serving.get(relay, 0) + 1
         self.assertLessEqual(max(serving.values()), 8)
+
+
+class ReciprocalLinks(unittest.TestCase):
+    def test_an_existing_reverse_link_is_never_silently_replaced(self):
+        """A relay already listing the producer must not have that link rewritten."""
+        topology = fixture()
+        nodes = topology['nodes']
+        # Make every spare relay already list bp-0 as one of its producers, so
+        # whichever spare is chosen for bp-0 would otherwise be overwritten.
+        for name in [n for n in nodes if n.startswith('spare-')]:
+            nodes[name]['producers']['bp-0'] = {
+                'bandwidth-bytes-per-second': 125000000, 'latency-ms': 99.0}
+        with self.assertRaises(ValueError):
+            bpup.add_upstreams(topology, 3)
 
 
 if __name__ == '__main__':

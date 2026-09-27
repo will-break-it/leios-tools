@@ -4,11 +4,13 @@ import csv
 import importlib.util
 import json
 import shutil
+import sys
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
 
+sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 BUNDLE = HERE.parent / 'docs/vote-diffusion-followup-20260915/evidence.tar.gz'
 
@@ -30,8 +32,18 @@ class Comparator(unittest.TestCase):
     def tearDownClass(cls):
         cls.temp.cleanup()
 
+    def scratch(self):
+        """A directory this test owns; removed when it finishes.
+
+        Each of these holds an expanded copy of the evidence bundle, so leaking
+        them fills the disk over repeated runs.
+        """
+        path = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        return Path(path)
+
     def run_compare(self, *matrices):
-        output = Path(tempfile.mkdtemp())
+        output = self.scratch()
         compare.main([*matrices, '--output', str(output)])
         with (output / 'comparison.csv').open() as stream:
             return list(csv.DictReader(stream)), output
@@ -44,6 +56,7 @@ class Comparator(unittest.TestCase):
                   for r in rows}
         unrestricted = by_arm[('push', 'all', 'false', '8/8')]
         self.assertEqual(unrestricted['wire_gb'], '32.684092')
+        self.assertEqual(unrestricted['wire_gb_exact'], 'true')
         self.assertEqual(unrestricted['relay_max_peak_mbit_s'], '60.649')
         self.assertEqual(unrestricted['q95_mean_s'], '3.334')
         protected = by_arm[('push', '8', 'true', '8/8')]
@@ -74,7 +87,7 @@ class Comparator(unittest.TestCase):
         self.assertEqual({r['matrix'] for r in rows}, {'vd2'})
 
     def test_duplicate_labels_are_rejected(self):
-        output = Path(tempfile.mkdtemp())
+        output = self.scratch()
         with self.assertRaises(ValueError):
             compare.main([f'same={self.matrix}', f'same={self.matrix}',
                           '--output', str(output)])
@@ -88,17 +101,40 @@ class Comparator(unittest.TestCase):
         self.assertEqual(columns.count('|'), len(compare.HEADINGS) + 1)
 
     def test_a_matrix_without_captures_reports_rounded_bytes_and_no_peaks(self):
-        copy = Path(tempfile.mkdtemp()) / 'no-capture'
+        copy = self.scratch() / 'no-capture'
         shutil.copytree(self.matrix, copy)
         (copy / 'vote-traffic-sha256.json').unlink()
+        for capture in copy.glob('*.vote-traffic.json'):
+            capture.unlink()
         rows, _ = self.run_compare(str(copy))
         for row in rows:
-            self.assertIn('rounded', row['wire_gb'])
+            self.assertEqual(row['wire_gb_exact'], 'false')
+            float(row['wire_gb'])
             self.assertEqual(row['relay_max_peak_mbit_s'], 'n/a')
             self.assertEqual(row['bp_max_peak_mbit_s'], 'n/a')
 
+    def test_captures_without_their_manifest_are_an_error(self):
+        copy = self.scratch() / 'unverifiable'
+        shutil.copytree(self.matrix, copy)
+        (copy / 'vote-traffic-sha256.json').unlink()
+        with self.assertRaises(ValueError):
+            self.run_compare(str(copy))
+
+    def test_wire_gb_is_numeric_in_every_row(self):
+        rows, _ = self.run_compare(str(self.matrix))
+        for row in rows:
+            float(row['wire_gb'])
+            self.assertEqual(row['wire_gb_exact'], 'true')
+
+    def test_comparing_does_not_write_into_the_matrix(self):
+        copy = self.scratch() / 'untouched'
+        shutil.copytree(self.matrix, copy)
+        before = sorted(p.name for p in copy.iterdir())
+        self.run_compare(str(copy))
+        self.assertEqual(sorted(p.name for p in copy.iterdir()), before)
+
     def test_an_incomplete_run_is_not_reported_as_a_result(self):
-        copy = Path(tempfile.mkdtemp()) / 'incomplete'
+        copy = self.scratch() / 'incomplete'
         shutil.copytree(self.matrix, copy)
         with (copy / 'runs.csv').open() as stream:
             rows = list(csv.DictReader(stream))
@@ -108,11 +144,11 @@ class Comparator(unittest.TestCase):
             writer = csv.DictWriter(stream, fieldnames=fields, lineterminator='\n')
             writer.writeheader()
             writer.writerows(rows)
-        with self.assertRaises(Exception):
+        with self.assertRaises(ValueError):
             self.run_compare(str(copy))
 
     def test_a_corrupted_capture_fails_its_checksum(self):
-        copy = Path(tempfile.mkdtemp()) / 'corrupt'
+        copy = self.scratch() / 'corrupt'
         shutil.copytree(self.matrix, copy)
         name = next(iter(json.loads((copy / 'vote-traffic-sha256.json').read_text())))
         (copy / name).write_text('{}')

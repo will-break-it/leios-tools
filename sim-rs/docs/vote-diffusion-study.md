@@ -411,8 +411,11 @@ python3 scripts/test-add-bp-upstreams.py
 ```
 
 A nondefault count adds a `-u<N>` token to every run name and a `bp_upstreams`
-column to `runs.csv`. The default adds neither, so published run names are
-unchanged and archived CSVs read as two.
+column to `runs.csv`; a nondefault latency mode adds a further `-copy` token and
+a `bp_upstream_latency` column. Defaults add neither, so published run names are
+unchanged and archived CSVs read as two upstreams, sampled. The derivation
+script is copied into the run directory and hashed alongside `runner.py`, so an
+archived matrix carries the code that produced its topology.
 
 ## Comparing matrices
 
@@ -431,9 +434,12 @@ reconciliation against the final network totals — and asserts nothing about
 which configurations a matrix contains. A label defaults to the directory name.
 
 Per-node captures are optional. Without them the byte total comes from the
-rounded figure in the run log, marked as such, and the peak columns read `n/a`:
-a peak cannot be recovered from network totals. Runs that did not pass are an
-error rather than a missing row.
+rounded figure in the run log, `wire_gb_exact` reads `false`, and the peak
+columns read `n/a`: a peak cannot be recovered from network totals. `wire_gb`
+stays numeric either way, so the CSV column has one type. A matrix holding
+captures without their checksum manifest is an error rather than a matrix
+without captures, and runs that did not pass are an error rather than a missing
+row. The comparator never writes into the matrices it reads.
 
 It writes `comparison.md` and `comparison.csv`. Re-running it on the published
 published follow-up bundle reproduces that report's traffic, peak and timing figures.

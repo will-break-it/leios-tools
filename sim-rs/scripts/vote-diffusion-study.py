@@ -15,10 +15,13 @@ import subprocess
 import sys
 import time
 
+# Set before importing add-bp-upstreams.py below: the loader writes a module's
+# bytecode before executing it, so the flag has to be set by the importer.
+sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parents[1]
 FIELDS = ['run', 'seed', 'nodes', 'committee', 'transport', 'fanout', 'slots',
           'status', 'started_utc', 'finished_utc', 'elapsed_s', 'exit_code', 'protects_producers',
-          'announcement_bytes', 'request_bytes', 'bp_upstreams']
+          'announcement_bytes', 'request_bytes', 'bp_upstreams', 'bp_upstream_latency']
 
 
 def atomic(path, text):
@@ -153,7 +156,10 @@ def main(argv=None):
     upstreams = positive(os.environ.get('VOTE_STUDY_BP_UPSTREAMS', '2'))
     if upstreams < 2:
         raise ValueError('VOTE_STUDY_BP_UPSTREAMS must be at least 2')
-    upstream_latency = choices('VOTE_STUDY_BP_UPSTREAM_LATENCY', 'sampled', {'sampled', 'copy'})[0]
+    latencies = choices('VOTE_STUDY_BP_UPSTREAM_LATENCY', 'sampled', {'sampled', 'copy'})
+    if len(latencies) != 1:
+        raise ValueError('VOTE_STUDY_BP_UPSTREAM_LATENCY must be sampled or copy')
+    upstream_latency = latencies[0]
     seeds = args.seeds or ['0']
     if any(not s.isascii() or not s.isdigit() for s in seeds):
         raise ValueError('Seeds must be nonnegative integers')
@@ -181,9 +187,18 @@ def main(argv=None):
         upstream = detected.stdout.strip() if detected.returncode == 0 else 'unknown (input bytes preserved)'
     atomic(root / 'upstream-revision.txt', upstream + '\n')
     shutil.copyfile(Path(__file__), root / 'runner.py')
+    # Copied and hashed for the same reason runner.py is: an archived matrix
+    # should carry the code that produced its topology, not just the result.
+    shutil.copyfile(HERE / 'scripts/add-bp-upstreams.py', root / 'add-bp-upstreams.py')
     for size in sizes:
         (root / f'topology-{size}.yaml').write_text(
             json.dumps(study_topology(size, upstreams, upstream_latency)))
+    # Fixed for the whole matrix: only a nondefault upstream count or latency
+    # mode adds a token, so every run name published before these knobs existed
+    # is unchanged.
+    upstream_token = '' if upstreams == 2 else f'-u{upstreams}'
+    if upstream_latency != 'sampled':
+        upstream_token += f'-{upstream_latency}'
     rows = []
     arms = [('announce-then-request', 'all')] if 'announce-then-request' in transports else []
     arms += [(transport, fanout) for fanout in fanouts
@@ -193,9 +208,6 @@ def main(argv=None):
             for committee in committees:
                 for transport, fanout in arms:
                     protection = str(protects and transport != 'announce-then-request' and fanout != 'all').lower()
-                    # Only a nondefault upstream count adds a token, so every
-                    # run name published before this knob existed is unchanged.
-                    upstream_token = '' if upstreams == 2 else f'-u{upstreams}'
                     name = (f'{size}-{committee}-{transport}-f{fanout}-bp{protection}'
                             f'-a{announcement_bytes}-r{request_bytes}{upstream_token}-s{seed}')
                     cap = 'null' if fanout == 'all' else str(int(fanout))
@@ -207,9 +219,10 @@ def main(argv=None):
                         f'vote-announcement-size-bytes: {announcement_bytes}\nvote-request-size-bytes: {request_bytes}\n')
                     rows.append(dict(zip(FIELDS, [name, seed, size, committee, transport, fanout, slots,
                                                 'planned', '', '', '', '', protection, announcement_bytes,
-                                                request_bytes, upstreams])))
+                                                request_bytes, upstreams, upstream_latency])))
     save_runs(root, rows)
-    inputs = manifest(root, [p.name for p in root.glob('*.yaml')] + ['source.patch', 'runner.py'])
+    inputs = manifest(root, [p.name for p in root.glob('*.yaml')] +
+                      ['source.patch', 'runner.py', 'add-bp-upstreams.py'])
     write_json(root / 'input-sha256.json', inputs)
     write_json(root / 'log-sha256.json', {})
     if dry_run:

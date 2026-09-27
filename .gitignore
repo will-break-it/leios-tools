@@ -13,5 +13,9 @@ sim-rs/parameters/behaviours/
 rss-*.csv
 package-lock.json
 
+# Python bytecode from scripts loaded via importlib
+__pycache__/
+*.py[cod]
+
 # Editor / OS
 .DS_Store
