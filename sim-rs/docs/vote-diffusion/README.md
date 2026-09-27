@@ -31,6 +31,13 @@ shrinks pull's penalty from 0.52s to 0.20s. It helps because a node then has
 three peers that might offer it a vote, so the request rule stops setting the
 tail: pull's 95th-percentile arrival falls from 0.875s to 0.362s.
 
+That result is [measured across three seeds](../vote-diffusion-three-relay-20260927/README.md),
+which agree to within a millisecond, and the two strategies reach **identical
+availability and endorsement counts at every seed** — pull loses no
+certificates, it arrives later. Placing the third relay in the producer's own
+rack rather than ~32 ms away narrows the penalty further, to 0.090s, so the
+honest range is **0.09–0.20s**.
+
 ## The announcement size decides more than the strategy does
 
 Pull does not send fewer messages. It sends **348.1M announcements** where push
@@ -58,13 +65,14 @@ nothing left to save on the body path.
 |---|---|---|
 | **Push vs pull** | Does vote streaming stay feasible at 750–1500 nodes, and how do the strategies compare? | done — 108 runs, seeds 0–2 |
 | **Control size and per-node traffic** | How much does pull depend on the announcement size, and where does the load sit? | done — 10 runs, seed 0 |
-| **Relays per producer** | Does a third upstream relay change the answer? | seed 0 done, seeds 1–2 running |
+| **Relays per producer** | Does a third upstream relay change the answer? | done — 10 runs, seeds 0–2, both relay placements |
 | **Publish vs receive** | Of that gain, how much is the producer publishing over three relays and how much is it receiving over three? | not started |
 | **Committee scale** | What burst does a network with ~1000 block producers produce? | not started |
 | **Serving limits** | Does offering to everyone but rate-limiting the *serving* side lower the peak without losing coverage? | needs simulator work |
 
-Evidence: [push vs pull](../vote-diffusion-results-20260910/README.md) and
-[control size and per-node traffic](../vote-diffusion-followup-20260915/README.md).
+Evidence: [push vs pull](../vote-diffusion-results-20260910/README.md),
+[control size and per-node traffic](../vote-diffusion-followup-20260915/README.md)
+and [three upstream relays](../vote-diffusion-three-relay-20260927/README.md).
 [How to run a matrix](../vote-diffusion-study.md).
 
 ## Ruled out

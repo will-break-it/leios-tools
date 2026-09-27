@@ -36,7 +36,7 @@ everything else**. Only that second part responds to the transport.
 Q0 is the first node anywhere, Q50 the stake-weighted median node, Q95 the
 95th-percentile node by stake. Q75 is instrumented too; the two-relay logs
 predate it, so it is absent for them rather than guessed. At three relays it is
-0.120s for push and 0.198s for pull. Each is the moment that node's own tally crosses
+0.120s for push and 0.198s for pull, identical across seeds 0–2. Each is the moment that node's own tally crosses
 75% of total active stake. Q95 is an availability quantile across nodes — it is
 not "95% of the votes" and not a worst-case guarantee.
 
@@ -87,8 +87,10 @@ committee, or a protocol burst — would not behave this way.
   400-slot cutoff leaves the newest EBs unfinished. Equal counts across arms do
   not prove the same EBs.
 - Send timestamps mean queued for transmission; receive timestamps mean delivered.
-- One seed, one topology, one committee mode. Seeds 1 and 2 are running for the
-  three-relay comparison.
+- The two-relay figures are one seed. The three-relay comparison is
+  [replicated across seeds 0–2](../vote-diffusion-three-relay-20260927/README.md),
+  which agree to within a millisecond, and across both placements of the third
+  relay (0.197s and 0.090s). One topology, one committee mode throughout.
 - No adversary. See [model-gaps.md](model-gaps.md) — an honest-network tail is
   not a bound on an attacked one, and the request rule is the part an adversary
   would target.
