@@ -52,11 +52,19 @@ def quorum(text,label,total,required=True):
     q.update(mean_s=float(m[1]) if m else None,median_s=float(m[2]) if m else None,p95_s=float(m[3]) if m else None,max_s=float(m[4]) if m else None)
     return q
 
+# Seats come from runs.csv where the runner recorded them; archived runs
+# predate the column and all used the 900-seat reference.
+def seats_for(size):
+    values={int(r.get('committee_seats') or 900) for r in runs if r['nodes']==size}
+    if len(values)!=1: raise ValueError(f'Mixed committee seat counts for {size} nodes: {values}')
+    return values.pop()
+
 topologies={}
 for size in sorted({r['nodes'] for r in runs}, key=int):
     nodes=json.loads((root/f'topology-{size}.yaml').read_text())['nodes']
     stakes=sorted((int(n.get('stake',0) or 0) for n in nodes.values()),reverse=True)
-    topologies[size]={'nodes':len(nodes),'pools':sum(s>0 for s in stakes),'total_stake':sum(stakes),'seated_stake':sum(stakes[:900]),'links':sum(len(n.get('producers',{})) for n in nodes.values())}
+    seats=seats_for(size)
+    topologies[size]={'nodes':len(nodes),'pools':sum(s>0 for s in stakes),'total_stake':sum(stakes),'seats':seats,'seated_stake':sum(stakes[:seats]),'links':sum(len(n.get('producers',{})) for n in nodes.values())}
 
 for row in runs:
     if row['status']!='passed': continue
@@ -76,7 +84,7 @@ for row in runs:
         topo=topologies[row['nodes']]
         r['voting_weight_generated']=int(m[1]) if m else r['votes_generated']
         r['quorum_threshold']=int(m[2]) if m else math.ceil(int(row['nodes'])*.75)
-        r['eligible_voters']=min(900,topo['pools']) if row['committee']=='top-stake-seats' else int(row['nodes'])
+        r['eligible_voters']=min(topo['seats'],topo['pools']) if row['committee']=='top-stake-seats' else int(row['nodes'])
         r['eligible_stake_fraction']=topo['seated_stake']/topo['total_stake'] if row['committee']=='top-stake-seats' else 1.0
         r['quorum_first']=quorum(final,'the first node anywhere',r['ebs_generated'])
         r['quorum_median']=quorum(final,'the stake-weighted median node',r['ebs_generated'])

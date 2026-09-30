@@ -417,6 +417,50 @@ unchanged and archived CSVs read as two upstreams, sampled. The derivation
 script is copied into the run directory and hashed alongside `runner.py`, so an
 archived matrix carries the code that produced its topology.
 
+## A committee that actually seats 900
+
+The v2 fixtures contain 216 and 458 stake pools, so `committee-seat-count: 900`
+seats every pool available and the seat count never binds. No run in this study
+exercises 900 distinct stake-weighted voters.
+
+`topology-v4-mainnet.yaml` does: **2685 nodes, every one a stake pool**, at a
+median degree of 37. Its top 900 pools hold 98.99% of active stake, comfortably
+clear of the 0.75 quorum, so a 900-seat committee can certify on it.
+
+It is a flat pool mesh with **no relays**. The producer/relay split that the v2
+runs report — relay peak bandwidth, protected fanout, upstream count — has no
+meaning there, and its diffusion structure differs, so its results are not
+directly comparable to the v2 matrices.
+
+`sim-cli` reads YAML, but the runner and extractor are standard-library only and
+PyYAML is not a dependency. Convert once:
+
+```sh
+python3 scripts/topology-to-json.py   ../data/simulation/pseudo-mainnet/topology-v4-mainnet.yaml /tmp/topology-v4.json
+```
+
+The converter accepts only the shape these fixtures use, and re-derives the node
+and link counts from the source text to check its own output before writing.
+
+Then run it, with a 9-byte offer and request — the size implied by the node
+fork's own `(slot, voter_id)` vote key when offers are batched per endorser
+block:
+
+```sh
+VOTE_STUDY_TOPOLOGY=/tmp/topology-v4.json VOTE_STUDY_COMMITTEE_SEATS=900 VOTE_STUDY_COMMITTEES=top-stake-seats VOTE_STUDY_TRANSPORTS='announce-then-request push' VOTE_STUDY_FANOUTS=all VOTE_STUDY_ANNOUNCEMENT_BYTES=9 VOTE_STUDY_REQUEST_BYTES=9 VOTE_STUDY_NODE_TRAFFIC=1 VOTE_STUDY_SLOTS=400 VOTE_STUDY_CONFIG_REVISION=<upstream revision>   python3 scripts/vote-diffusion-study.py <study-config.yaml> /tmp/vote-900 0
+```
+
+`VOTE_STUDY_TOPOLOGY` supplies the fixture verbatim: no relay marking, no
+bandwidth or core-count override, and the node count becomes the run size.
+`VOTE_STUDY_SIZES` and `VOTE_STUDY_BP_UPSTREAMS` do not apply and are rejected
+rather than ignored. `bp_upstreams` and `bp_upstream_latency` are recorded empty,
+since they describe the v2 structure rather than this one. A nondefault seat
+count adds a `-c<N>` run-name token and is recorded in `runs.csv`; the extractor
+reads it from there instead of assuming 900, so archived runs still read as 900.
+
+Expect roughly 2.5x the links and 2x the voters of the 1500-node runs, so plan
+for a few hours per arm and check one pilot run before queueing a matrix.
+
 ## Comparing matrices
 
 `summarize-vote-diffusion-followup.py` reports one fixed ten-case matrix.
