@@ -160,19 +160,27 @@ def markdown(payload):
              + ', '.join(map(str, payload['seeds'])) + '.', '',
              'Traffic is exact decimal GB from per-node captures and includes vote bodies, announcements and requests. '
              'It excludes TCP/IP. The 40/40 and 64/64 byte cases are sensitivity assumptions, not verified encodings. '
-             'Q95 means quorum availability at nodes holding 95% of stake; each node needs 75% of total voting stake. '
+             'Q50/Q75/Q95 mean quorum availability at nodes holding that share of stake; each node needs 75% of total voting stake. '
+             'The quantile varies the observer, not the certificate threshold, which is always 75%. '
+             'Q75 is absent for runs whose logs predate that observer. '
              'Timing means are conditional on attainment and may cover different EBs. Newest EBs may be unfinished at the fixed cutoff.', '',
              '## Availability and traffic', '',
              'Protected BP links take places within the total fanout cap. Protecting one BP under cap 22 leaves 21 places for other consumers.', '',
-             '| Seed | Transport | Cap | Protect BP | Announce/request B | EBs | Q50 | Q95 | Q95 by 7s | Q95 mean s | Endorsements | Bundles at 95% of nodes | Wire GB |',
-             '|---:|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|']
+             '| Seed | Transport | Cap | Protect BP | Announce/request B | EBs | Q50 | Q75 | Q95 | Q95 by 7s | Q75 mean s | Q95 mean s | Endorsements | Bundles at 95% of nodes | Wire GB |',
+             '|---:|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
     for item in payload['results']:
         r = item['protocol']; q = r['quorum_p95']; coverage = r['bundle_coverage95']
+        q75 = r.get('quorum_q75')
+        # Nested same-quote f-strings need 3.12; the runner supports 3.11.
+        q75_reached = f"{q75['reached']}/{q75['total']}" if q75 else 'n/a'
+        q75_mean = fmt(q75['mean_s']) if q75 else 'n/a'
         covered = f"{coverage['reached']}/{coverage['total']}" if coverage else 'n/a'
         lines.append(f"| {r['seed']} | {r['transport']} | {r['fanout']} | {r['protects_producers']} | "
                      f"{r['announcement_bytes']}/{r['request_bytes']} | {r['ebs_generated']} | "
-                     f"{r['quorum_median']['reached']}/{r['ebs_generated']} | {q['reached']}/{q['total']} | "
-                     f"{q['by_vote_deadline']}/{q['total']} | {fmt(q['mean_s'])} | {r['l1_endorsements']} | "
+                     f"{r['quorum_median']['reached']}/{r['ebs_generated']} | "
+                     f"{q75_reached} | {q['reached']}/{q['total']} | "
+                     f"{q['by_vote_deadline']}/{q['total']} | {q75_mean} | "
+                     f"{fmt(q['mean_s'])} | {r['l1_endorsements']} | "
                      f"{covered} | {item['wire']['sent']['total_bytes']/1e9:.6f} |")
     lines += ['', '## Control-size sensitivity', '',
               'The same unrestricted push case is the baseline for all three pull cases because it sends no control messages. '

@@ -294,11 +294,19 @@ class StudyInterfaceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         with (output / 'runs.csv').open() as stream:
             reader = csv.DictReader(stream)
-            self.assertEqual(reader.fieldnames, list(self.rows[0]) + ['protects_producers', 'announcement_bytes', 'request_bytes'])
+            self.assertEqual(reader.fieldnames, list(self.rows[0]) +
+                             ['protects_producers', 'announcement_bytes', 'request_bytes',
+                              'bp_upstreams', 'bp_upstream_latency', 'committee_seats'])
             rows = list(reader)
         self.assertEqual(len(rows), 108)
         self.assertEqual(len({r['run'] for r in rows}), 108)
         self.assertTrue(all(r['status'] == 'planned' for r in rows))
+        # The default upstream count adds no run-name token, so names published
+        # before the knob existed still match.
+        self.assertEqual({r['bp_upstreams'] for r in rows}, {'2'})
+        self.assertEqual({r['bp_upstream_latency'] for r in rows}, {'sampled'})
+        self.assertEqual({r['committee_seats'] for r in rows}, {'900'})
+        self.assertFalse([r['run'] for r in rows if '-u' in r['run']])
         for name in ['input-sha256.json', 'log-sha256.json', 'revision.txt', 'upstream-revision.txt']:
             self.assertTrue((output / name).is_file(), name)
         checksums = json.loads((output / 'input-sha256.json').read_text())
@@ -309,6 +317,113 @@ class StudyInterfaceTests(unittest.TestCase):
             self.assertIn(f'vote-transport: "{row["transport"]}"', overlay)
             self.assertIn(f'vote-push-fanout: {"null" if row["fanout"] == "all" else row["fanout"]}', overlay)
             self.assertIn('vote-push-fanout-protects-producers: false', overlay)
+
+    def test_a_nondefault_upstream_count_is_named_and_recorded(self):
+        output = self.root / 'upstream-plan'
+        env = {k: v for k, v in os.environ.items() if not k.startswith('VOTE_STUDY_')}
+        env.update(VOTE_STUDY_DRY_RUN='1', VOTE_STUDY_SIZES='1500',
+                   VOTE_STUDY_COMMITTEES='top-stake-seats', VOTE_STUDY_TRANSPORTS='push',
+                   VOTE_STUDY_FANOUTS='8', VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS='true',
+                   VOTE_STUDY_BP_UPSTREAMS='3')
+        result = subprocess.run([str(RUNNER), str(self.archive / 'study-config.yaml'),
+                                 str(output), '0'], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with (output / 'runs.csv').open() as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual([r['bp_upstreams'] for r in rows], ['3'])
+        self.assertIn('-u3-s0', rows[0]['run'])
+        self.assertEqual([r['bp_upstream_latency'] for r in rows], ['sampled'])
+        nodes = json.loads((output / 'topology-1500.yaml').read_text())['nodes']
+        degrees = {len(v['producers']) for v in nodes.values() if v.get('stake', 0)}
+        self.assertEqual(degrees, {3})
+
+    def test_a_nondefault_latency_mode_is_named_and_recorded(self):
+        """Two matrices differing only in latency mode must not share a record."""
+        output = self.root / 'latency-plan'
+        env = {k: v for k, v in os.environ.items() if not k.startswith('VOTE_STUDY_')}
+        env.update(VOTE_STUDY_DRY_RUN='1', VOTE_STUDY_SIZES='1500',
+                   VOTE_STUDY_COMMITTEES='top-stake-seats', VOTE_STUDY_TRANSPORTS='push',
+                   VOTE_STUDY_FANOUTS='all', VOTE_STUDY_BP_UPSTREAMS='3',
+                   VOTE_STUDY_BP_UPSTREAM_LATENCY='copy')
+        result = subprocess.run([str(RUNNER), str(self.archive / 'study-config.yaml'),
+                                 str(output), '0'], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with (output / 'runs.csv').open() as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual([r['bp_upstream_latency'] for r in rows], ['copy'])
+        self.assertIn('-u3-copy-s0', rows[0]['run'])
+
+    def test_a_multi_valued_latency_mode_is_rejected(self):
+        output = self.root / 'latency-rejected'
+        env = {k: v for k, v in os.environ.items() if not k.startswith('VOTE_STUDY_')}
+        env.update(VOTE_STUDY_DRY_RUN='1', VOTE_STUDY_BP_UPSTREAM_LATENCY='sampled copy')
+        result = subprocess.run([str(RUNNER), str(self.archive / 'study-config.yaml'),
+                                 str(output), '0'], env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_the_derivation_script_is_saved_and_hashed(self):
+        output = self.root / 'derivation-plan'
+        env = {k: v for k, v in os.environ.items() if not k.startswith('VOTE_STUDY_')}
+        env.update(VOTE_STUDY_DRY_RUN='1', VOTE_STUDY_SIZES='1500',
+                   VOTE_STUDY_COMMITTEES='top-stake-seats', VOTE_STUDY_TRANSPORTS='push',
+                   VOTE_STUDY_FANOUTS='all', VOTE_STUDY_BP_UPSTREAMS='3')
+        result = subprocess.run([str(RUNNER), str(self.archive / 'study-config.yaml'),
+                                 str(output), '0'], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = output / 'add-bp-upstreams.py'
+        self.assertTrue(saved.is_file())
+        self.assertEqual(saved.read_bytes(),
+                         (RUNNER.parent / 'add-bp-upstreams.py').read_bytes())
+        checksums = json.loads((output / 'input-sha256.json').read_text())
+        self.assertIn('add-bp-upstreams.py', checksums)
+
+    def test_an_explicit_topology_sets_the_size_and_is_copied_verbatim(self):
+        """A flat pool mesh is used as given: no relay marking, no overrides."""
+        fixture = self.root / 'flat.json'
+        nodes = {f'node-{i}': {'stake': 1000 + i, 'location': [float(i), 0.0],
+                               'cpu-core-count': 4,
+                               'producers': {f'node-{(i + 1) % 6}': {
+                                   'latency-ms': 5.0, 'bandwidth-bytes-per-second': 125000000}}}
+                 for i in range(6)}
+        fixture.write_text(json.dumps({'nodes': nodes}))
+        output = self.root / 'fixture-plan'
+        env = {k: v for k, v in os.environ.items() if not k.startswith('VOTE_STUDY_')}
+        env.update(VOTE_STUDY_DRY_RUN='1', VOTE_STUDY_TOPOLOGY=str(fixture),
+                   VOTE_STUDY_COMMITTEES='top-stake-seats', VOTE_STUDY_TRANSPORTS='push',
+                   VOTE_STUDY_FANOUTS='all', VOTE_STUDY_COMMITTEE_SEATS='4')
+        result = subprocess.run([str(RUNNER), str(self.archive / 'study-config.yaml'),
+                                 str(output), '0'], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with (output / 'runs.csv').open() as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual([r['nodes'] for r in rows], ['6'])
+        self.assertEqual([r['bp_upstreams'] for r in rows], [''])
+        self.assertEqual([r['bp_upstream_latency'] for r in rows], [''])
+        self.assertEqual([r['committee_seats'] for r in rows], ['4'])
+        self.assertIn('-c4-s0', rows[0]['run'])
+        self.assertEqual(json.loads((output / 'topology-6.yaml').read_text()), {'nodes': nodes})
+        self.assertIn('committee-seat-count: 4', (output / (rows[0]['run'] + '.yaml')).read_text())
+
+    def test_explicit_topology_rejects_options_that_do_not_apply(self):
+        fixture = self.root / 'flat2.json'
+        fixture.write_text(json.dumps({'nodes': {'node-0': {'stake': 1, 'location': [0.0, 0.0],
+                                                            'cpu-core-count': 4, 'producers': {}}}}))
+        env = {k: v for k, v in os.environ.items() if not k.startswith('VOTE_STUDY_')}
+        for extra in ({'VOTE_STUDY_SIZES': '1500'}, {'VOTE_STUDY_BP_UPSTREAMS': '3'}):
+            with self.subTest(extra=extra):
+                run_env = dict(env, VOTE_STUDY_DRY_RUN='1', VOTE_STUDY_TOPOLOGY=str(fixture), **extra)
+                result = subprocess.run([str(RUNNER), str(self.archive / 'study-config.yaml'),
+                                         str(self.root / f'reject-{len(extra)}-{"".join(extra)}'), '0'],
+                                        env=run_env, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_an_upstream_count_below_two_is_rejected(self):
+        output = self.root / 'rejected-plan'
+        env = {k: v for k, v in os.environ.items() if not k.startswith('VOTE_STUDY_')}
+        env.update(VOTE_STUDY_DRY_RUN='1', VOTE_STUDY_BP_UPSTREAMS='1')
+        result = subprocess.run([str(RUNNER), str(self.archive / 'study-config.yaml'),
+                                 str(output), '0'], env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == '__main__':

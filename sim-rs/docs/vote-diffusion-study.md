@@ -1,5 +1,9 @@
 # Linear Leios vote diffusion study
 
+This is the how-to: configuration knobs, the run matrix and reproduction. For what
+was asked, what was found and what it supports, start at the
+[findings page](vote-diffusion/README.md).
+
 The question is whether simple vote streaming remains feasible with a large
 committee, and whether selective fetching or reduced fanout improves timing,
 bandwidth or verification cost. The comparison covers Linear Leios. Full Haskell
@@ -149,6 +153,8 @@ for byte from their bundled evidence.
 ```sh
 cargo test --workspace --locked --offline
 python3 scripts/test-vote-diffusion-study.py
+python3 scripts/test-add-bp-upstreams.py
+python3 scripts/test-compare-vote-matrices.py
 python3 scripts/test-summarize-vote-traffic.py
 python3 scripts/test-vote-traffic-cli.py --binary target/release/sim-cli
 ```
@@ -211,6 +217,8 @@ Defaults:
 | `VOTE_STUDY_REQUEST_BYTES` | `8` |
 | `VOTE_STUDY_NODE_TRAFFIC` | `0` (set `1` to save per-node vote traffic) |
 | `VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS` | `false` |
+| `VOTE_STUDY_BP_UPSTREAMS` | `2` (the fixture's own degree) |
+| `VOTE_STUDY_BP_UPSTREAM_LATENCY` | `sampled` (or `copy`) |
 | `VOTE_STUDY_SLOTS` | `400` |
 | `VOTE_STUDY_DRY_RUN` | `0` |
 | `VOTE_STUDY_CONFIG_REVISION` | Detected from base config, or explicitly unknown |
@@ -223,7 +231,7 @@ protected BP connections take places within the same total cap: one protected
 BP at fanout 22 leaves 21 places for other consumers. Source exclusion still
 applies. A node with more protected consumers than the cap is rejected.
 
-The runner marks each BP's two upstream entries with `always-forward-votes: true`
+The runner marks each BP's upstream entries with `always-forward-votes: true`
 in both saved study topologies. Routing uses those explicit markers, not stake.
 For other topologies, mark the consumer's own relay entries under `producers`.
 Enabling protection with a bounded cap requires marked links and at least one
@@ -256,12 +264,16 @@ that plan directory, or extract the exact overlay from the published input
 archive. The runner produces the complete committee, seed, transport and fanout
 settings together; separate transport presets are unnecessary.
 
-Record quorum attainment and misses per EB, Q50/Q95 attainment, vote
+Record quorum attainment and misses per EB, Q50/Q75/Q95 attainment, vote
 bodies generated, actual eligible stake, total protocol bytes, completed
 verifications, accepted arrivals and pending arrivals. Keep a fixed scenario
 and seed across each comparison. The reported Q95 time is a mean of per-EB times
 at which nodes holding 95% of stake each have a quorum; it is not a worst-case
-deadline guarantee. Preserve miss counts alongside conditional timing averages.
+deadline guarantee. Q75 is the same measure at 75% of stake. It varies the
+observer, not the certificate threshold, which `quorum-weight-fraction` fixes at
+75% of total active stake in every arm. Logs written before the Q75 observer
+existed have no such line; the extractor leaves the field absent for them rather
+than inventing a value, so archived results re-extract unchanged. Preserve miss counts alongside conditional timing averages.
 
 ## Limits on transfer to the Haskell node
 
@@ -361,6 +373,120 @@ path aliases, monitor failure, interruption and retry:
 python3 scripts/test-vote-traffic-cli.py --binary target/release/sim-cli
 python3 scripts/test-summarize-vote-traffic.py
 ```
+
+## Block producer upstream count
+
+The fixtures give each BP two upstream relays. SPO practice is commonly two
+public relays plus a third that is not registered on chain, so
+`VOTE_STUDY_BP_UPSTREAMS` derives a variant with a different degree:
+
+```sh
+VOTE_STUDY_BP_UPSTREAMS=3 ./scripts/vote-diffusion-study.sh <config> <output> 0
+```
+
+The variant is **derived from the same fixture**, not generated fresh, so every
+other property is identical — locations, stake, relay graph, existing latencies,
+bandwidth, core counts — and a comparison isolates the upstream count. Links are
+added in both directions, matching how the fixture already connects a BP to its
+relays.
+
+Selection is least-loaded first, then nearest. Plain nearest-relay selection put
+105 producers behind one relay on the 1500-node fixture, which no tested
+protected cap can serve and which would dominate the result for reasons
+unrelated to the upstream count. Balanced, the busiest relay serves two.
+
+`VOTE_STUDY_BP_UPSTREAM_LATENCY` chooses the added link's latency. `sampled`
+draws from the source topology's own distance-to-latency pool, the rule
+`generate-topology.py` uses; on the 1500-node fixture that gives a median of
+about 32 ms, because the third relay is not in the producer's rack while its two
+existing ones are (about 0.2 ms). `copy` reuses the producer's existing link
+latency instead, modelling a co-located private relay. **The two bracket a real
+deployment; run both before reading much into the result.**
+
+The topology can also be derived on its own:
+
+```sh
+python3 scripts/add-bp-upstreams.py   ../data/simulation/pseudo-mainnet/topology-v2-1500.yaml /tmp/topology-u3.yaml   --upstreams 3
+python3 scripts/test-add-bp-upstreams.py
+```
+
+A nondefault count adds a `-u<N>` token to every run name and a `bp_upstreams`
+column to `runs.csv`; a nondefault latency mode adds a further `-copy` token and
+a `bp_upstream_latency` column. Defaults add neither, so published run names are
+unchanged and archived CSVs read as two upstreams, sampled. The derivation
+script is copied into the run directory and hashed alongside `runner.py`, so an
+archived matrix carries the code that produced its topology.
+
+## A committee that actually seats 900
+
+The v2 fixtures contain 216 and 458 stake pools, so `committee-seat-count: 900`
+seats every pool available and the seat count never binds. No run in this study
+exercises 900 distinct stake-weighted voters.
+
+`topology-v4-mainnet.yaml` does: **2685 nodes, every one a stake pool**, at a
+median degree of 37. Its top 900 pools hold 98.99% of active stake, comfortably
+clear of the 0.75 quorum, so a 900-seat committee can certify on it.
+
+It is a flat pool mesh with **no relays**. The producer/relay split that the v2
+runs report — relay peak bandwidth, protected fanout, upstream count — has no
+meaning there, and its diffusion structure differs, so its results are not
+directly comparable to the v2 matrices.
+
+`sim-cli` reads YAML, but the runner and extractor are standard-library only and
+PyYAML is not a dependency. Convert once:
+
+```sh
+python3 scripts/topology-to-json.py   ../data/simulation/pseudo-mainnet/topology-v4-mainnet.yaml /tmp/topology-v4.json
+```
+
+The converter accepts only the shape these fixtures use, and re-derives the node
+and link counts from the source text to check its own output before writing.
+
+Then run it, with a 9-byte offer and request — the size implied by the node
+fork's own `(slot, voter_id)` vote key when offers are batched per endorser
+block:
+
+```sh
+VOTE_STUDY_TOPOLOGY=/tmp/topology-v4.json VOTE_STUDY_COMMITTEE_SEATS=900 VOTE_STUDY_COMMITTEES=top-stake-seats VOTE_STUDY_TRANSPORTS='announce-then-request push' VOTE_STUDY_FANOUTS=all VOTE_STUDY_ANNOUNCEMENT_BYTES=9 VOTE_STUDY_REQUEST_BYTES=9 VOTE_STUDY_NODE_TRAFFIC=1 VOTE_STUDY_SLOTS=400 VOTE_STUDY_CONFIG_REVISION=<upstream revision>   python3 scripts/vote-diffusion-study.py <study-config.yaml> /tmp/vote-900 0
+```
+
+`VOTE_STUDY_TOPOLOGY` supplies the fixture verbatim: no relay marking, no
+bandwidth or core-count override, and the node count becomes the run size.
+`VOTE_STUDY_SIZES` and `VOTE_STUDY_BP_UPSTREAMS` do not apply and are rejected
+rather than ignored. `bp_upstreams` and `bp_upstream_latency` are recorded empty,
+since they describe the v2 structure rather than this one. A nondefault seat
+count adds a `-c<N>` run-name token and is recorded in `runs.csv`; the extractor
+reads it from there instead of assuming 900, so archived runs still read as 900.
+
+Expect roughly 2.5x the links and 2x the voters of the 1500-node runs, so plan
+for a few hours per arm and check one pilot run before queueing a matrix.
+
+## Comparing matrices
+
+`summarize-vote-diffusion-followup.py` reports one fixed ten-case matrix.
+`compare-vote-matrices.py` puts the arms of any number of completed matrices in
+a single table, so a new matrix is read against the ones it is meant to be
+compared with:
+
+```sh
+python3 scripts/compare-vote-matrices.py   two-relay=/tmp/vote-followup three-relay=/tmp/vote-u3 --output /tmp/comparison
+```
+
+It applies the same checks as the focused summarizer — frozen input and log
+checksums through the protocol extractor, capture checksums, per-node
+reconciliation against the final network totals — and asserts nothing about
+which configurations a matrix contains. A label defaults to the directory name.
+
+Per-node captures are optional. Without them the byte total comes from the
+rounded figure in the run log, `wire_gb_exact` reads `false`, and the peak
+columns read `n/a`: a peak cannot be recovered from network totals. `wire_gb`
+stays numeric either way, so the CSV column has one type. A matrix holding
+captures without their checksum manifest is an error rather than a matrix
+without captures, and runs that did not pass are an error rather than a missing
+row. The comparator never writes into the matrices it reads.
+
+It writes `comparison.md` and `comparison.csv`. Re-running it on the published
+published follow-up bundle reproduces that report's traffic, peak and timing figures.
 
 ## Focused fanout and control-size follow-up
 

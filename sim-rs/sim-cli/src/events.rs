@@ -1508,6 +1508,10 @@ const QUORUM_OBSERVERS: &[(&str, f64)] = &[
         0.5,
     ),
     (
+        "the 75th-percentile node by stake (all but the slowest quarter of the stake)",
+        0.75,
+    ),
+    (
         "the 95th-percentile node by stake (all but the slowest twentieth of the stake)",
         0.95,
     ),

@@ -35,21 +35,36 @@ def extract(text,pattern,required=True):
         return None
     return matches[-1]
 
-def quorum(text,label,total):
+def quorum(text,label,total,required=True):
+    pattern=r'^  Quorum at '+label+r'[^\n]+'
+    found=extract(text,pattern,False)
+    # Logs written before the Q75 observer existed have no such line.  Leave
+    # the field absent rather than inventing a value: archived results must
+    # re-extract unchanged, including runs that generated no EB at all.
+    if found is None and not required: return None
     if total == 0:
         return dict(reached=0,total=0,by_vote_deadline=0,vote_deadline_s=None,by_inclusion=0,inclusion_s=None,mean_s=None,median_s=None,p95_s=None,max_s=None)
-    line=extract(text,r'^  Quorum at '+label+r'[^\n]+').group(0)
+    if found is None: raise ValueError('Missing metric: '+pattern)
+    line=found.group(0)
     m=extract(line,r': (\d+) of (\d+) EB\(s\) reached one, (\d+) of them by the ([\d.]+)s deadline and (\d+) by the ([\d.]+)s inclusion deadline\.')
     q=dict(zip(['reached','total','by_vote_deadline','vote_deadline_s','by_inclusion','inclusion_s'],[int(m[1]),int(m[2]),int(m[3]),float(m[4]),int(m[5]),float(m[6])]))
     m=extract(line,r'Average ([\d.]+)s from t0 \(median ([\d.]+), p95 ([\d.]+), max ([\d.]+)\)',False)
     q.update(mean_s=float(m[1]) if m else None,median_s=float(m[2]) if m else None,p95_s=float(m[3]) if m else None,max_s=float(m[4]) if m else None)
     return q
 
+# Seats come from runs.csv where the runner recorded them; archived runs
+# predate the column and all used the 900-seat reference.
+def seats_for(size):
+    values={int(r.get('committee_seats') or 900) for r in runs if r['nodes']==size}
+    if len(values)!=1: raise ValueError(f'Mixed committee seat counts for {size} nodes: {values}')
+    return values.pop()
+
 topologies={}
 for size in sorted({r['nodes'] for r in runs}, key=int):
     nodes=json.loads((root/f'topology-{size}.yaml').read_text())['nodes']
     stakes=sorted((int(n.get('stake',0) or 0) for n in nodes.values()),reverse=True)
-    topologies[size]={'nodes':len(nodes),'pools':sum(s>0 for s in stakes),'total_stake':sum(stakes),'seated_stake':sum(stakes[:900]),'links':sum(len(n.get('producers',{})) for n in nodes.values())}
+    seats=seats_for(size)
+    topologies[size]={'nodes':len(nodes),'pools':sum(s>0 for s in stakes),'total_stake':sum(stakes),'seats':seats,'seated_stake':sum(stakes[:seats]),'links':sum(len(n.get('producers',{})) for n in nodes.values())}
 
 for row in runs:
     if row['status']!='passed': continue
@@ -69,10 +84,12 @@ for row in runs:
         topo=topologies[row['nodes']]
         r['voting_weight_generated']=int(m[1]) if m else r['votes_generated']
         r['quorum_threshold']=int(m[2]) if m else math.ceil(int(row['nodes'])*.75)
-        r['eligible_voters']=min(900,topo['pools']) if row['committee']=='top-stake-seats' else int(row['nodes'])
+        r['eligible_voters']=min(topo['seats'],topo['pools']) if row['committee']=='top-stake-seats' else int(row['nodes'])
         r['eligible_stake_fraction']=topo['seated_stake']/topo['total_stake'] if row['committee']=='top-stake-seats' else 1.0
         r['quorum_first']=quorum(final,'the first node anywhere',r['ebs_generated'])
         r['quorum_median']=quorum(final,'the stake-weighted median node',r['ebs_generated'])
+        q75=quorum(final,'the 75th-percentile node by stake',r['ebs_generated'],False)
+        if q75 is not None: r['quorum_q75']=q75
         r['quorum_p95']=quorum(final,'the 95th-percentile node by stake',r['ebs_generated'])
         m=extract(final,r'(\d+) Vote body message\(s\) were sent\. (\d+) of them were received .*? (\d+) of those .*?; (\d+) accepted; (\d+) pending; (\d+) verification\(s\) completed')
         for field,value in zip(['bodies_sent','bodies_received','redundant_arrivals','accepted','pending','verifications'],m.groups()): r[field]=int(value)
