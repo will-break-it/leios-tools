@@ -58,6 +58,36 @@ fn generate_random_tx(rng: &mut StdRng, min_size: usize, max_size: usize) -> Pen
     }
 }
 
+/// Decode a hex string (the tx body as hex) into bytes.
+fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return Err(format!("odd hex length: {} characters", s.len()));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| format!("bad hex at byte {}: {e}", i / 2))
+        })
+        .collect()
+}
+
+/// Load signed tx bodies from a file: one hex-encoded body per line. The tx id
+/// is derived from the body, matching what the node computes.
+fn load_txfile(path: &str) -> Result<Vec<PendingTx>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let body = decode_hex(l)?;
+            Ok(PendingTx::new_with_body(
+                TxBody::new_with_vec(body),
+                txsubmission::ORIGIN_ERA,
+            ))
+        })
+        .collect()
+}
+
 pub async fn run(
     host: &str,
     magic: u64,
@@ -65,8 +95,16 @@ pub async fn run(
     min_size: usize,
     max_size: usize,
     count: Option<usize>,
+    txfile: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("connecting to {host}...");
+
+    // Real signed txs from a file, or random ones. Loaded before connecting so
+    // a malformed file fails before the handshake.
+    let real: Option<Vec<PendingTx>> = match txfile {
+        Some(path) => Some(load_txfile(path).map_err(|e| format!("load {path}: {e}"))?),
+        None => None,
+    };
 
     let ts_proto = ProtocolConfig {
         id: txsubmission::PROTOCOL_ID,
@@ -116,11 +154,13 @@ pub async fn run(
     let (tx_sender, mut tx_receiver) = tokio::sync::mpsc::channel::<PendingTx>(16);
 
     // Determine how many txs to generate.
-    let total = match (tx_rate, count) {
-        (None, None) => 1usize,        // single tx mode
-        (None, Some(n)) => n,          // fixed count, no delay
-        (Some(_), None) => usize::MAX, // infinite stream
-        (Some(_), Some(n)) => n,       // stream with limit
+    let total = match (&real, tx_rate, count) {
+        (Some(rs), _, Some(n)) => n.min(rs.len()),
+        (Some(rs), _, None) => rs.len(),
+        (None, None, None) => 1usize,        // single tx mode
+        (None, None, Some(n)) => n,          // fixed count, no delay
+        (None, Some(_), None) => usize::MAX, // infinite stream
+        (None, Some(_), Some(n)) => n,       // stream with limit
     };
 
     let rate_desc = match tx_rate {
@@ -142,6 +182,23 @@ pub async fn run(
 
     // Spawn tx generator task.
     let generator = tokio::spawn(async move {
+        if let Some(txs) = real {
+            for i in 0..total.min(txs.len()) {
+                if let Some(rate) = tx_rate {
+                    if i > 0 {
+                        let mut rng = StdRng::from_entropy();
+                        let interval = exp_sample(&mut rng, rate);
+                        tokio::time::sleep(interval).await;
+                    }
+                }
+                let tx = txs[i].clone();
+                println!("  submitted tx #{} ({} bytes)", i + 1, tx.tx.size);
+                if tx_sender.send(tx).await.is_err() {
+                    break;
+                }
+            }
+            return;
+        }
         let mut rng = StdRng::from_entropy();
 
         for i in 0..total {

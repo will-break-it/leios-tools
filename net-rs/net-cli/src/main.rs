@@ -166,6 +166,12 @@ enum Command {
         /// Number of transactions to submit (default: 1 if no --tx-rate, infinite otherwise)
         #[arg(long)]
         count: Option<usize>,
+
+        /// File of hex-encoded signed tx bodies, one per line, submitted as-is
+        /// (tx id derived from the body). When set, `--min-size`/`--max-size`
+        /// are ignored.
+        #[arg(long)]
+        txfile: Option<String>,
     },
 
     /// Request peers from a node via PeerSharing
@@ -350,7 +356,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             min_size,
             max_size,
             count,
-        } => submit::run(&host, magic, tx_rate, min_size, max_size, count).await,
+            txfile,
+        } => submit::run(&host, magic, tx_rate, min_size, max_size, count, txfile.as_deref()).await,
         Command::PeerShare {
             host,
             magic,
